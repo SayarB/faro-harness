@@ -2,6 +2,8 @@
 
 Local-first native AI harness for non-technical users, built with **Go** workers (SQLite WAL + FTS5 + BLAKE3 + fast header peeks) and a **React + TypeScript** UI via **Wails v2**.
 
+Read the full product vision and roadmap in [docs/IDEA.md](docs/IDEA.md).
+
 ## Architecture
 
 Instead of eagerly parsing giant PDFs, 300k-row spreadsheets, and `.zip` archives into a heavy vector DB, `faro-harness` treats the local index like a **fast library card catalog**:
