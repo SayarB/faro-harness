@@ -1,0 +1,27 @@
+# Go / Wails build artifacts
+/build/bin/
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/wailsjs/
+
+# Local data / SQLite databases
+*.db
+*.db-wal
+*.db-shm
+/.faro/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
