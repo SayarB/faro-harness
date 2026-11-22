@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/SayarB/faro-harness/internal/agent"
+	"github.com/SayarB/faro-harness/internal/approval"
 	"github.com/SayarB/faro-harness/internal/bot"
 	"github.com/SayarB/faro-harness/internal/llm"
 	"github.com/SayarB/faro-harness/internal/store"
@@ -55,6 +56,8 @@ type Controller struct {
 	turnID   string
 	turnStop context.CancelFunc
 	indexing map[int64]bool
+	gate     *approval.Gate
+	pending  map[string]chan approval.Choice // approval id -> answer channel
 }
 
 // New creates a Controller.
@@ -69,10 +72,12 @@ func New(opts Options) (*Controller, error) {
 		opts.NewClient = func(key string) (llm.Client, error) { return llm.NewVercelGatewayClient(key, "") }
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Controller{
+	c := &Controller{
 		st: opts.Store, bots: opts.Bots, dataDir: opts.DataDir, emit: opts.Emit, newCli: opts.NewClient,
-		rootCtx: ctx, cancel: cancel, indexing: map[int64]bool{},
-	}, nil
+		rootCtx: ctx, cancel: cancel, indexing: map[int64]bool{}, pending: map[string]chan approval.Choice{},
+	}
+	c.gate = c.newGate()
+	return c, nil
 }
 
 // Shutdown cancels running turns and indexing and waits for them to stop.
@@ -269,6 +274,7 @@ func (c *Controller) NewChat(ctx context.Context, botSlug string) (ChatInfo, err
 	if c.busy {
 		return ChatInfo{}, errors.New("a reply is still in progress")
 	}
+	c.gate = c.newGate() // a new chat starts with no remembered approvals
 	sess, err := c.buildSession(ctx, botSlug, "")
 	if err != nil {
 		return ChatInfo{}, err
@@ -277,8 +283,8 @@ func (c *Controller) NewChat(ctx context.Context, botSlug string) (ChatInfo, err
 	return ChatInfo{ConversationID: sess.ConversationID(), BotSlug: botSlug}, nil
 }
 
-// buildSession must be called with c.mu held. No approver is installed: deliver_file and
-// bot_run_command are denied by the tools layer until an approval UI exists.
+// buildSession must be called with c.mu held. Gated tools (deliver_file, bot_run_command) go
+// through the approval Gate, which asks the user via the approval dialog.
 func (c *Controller) buildSession(ctx context.Context, botSlug, convID string) (*agent.Session, error) {
 	key := c.apiKey()
 	if key == "" {
@@ -304,7 +310,7 @@ func (c *Controller) buildSession(ctx context.Context, botSlug, convID string) (
 	if len(wss) == 0 && b == nil {
 		return nil, errors.New("add a folder first (or choose a bot)")
 	}
-	reg, err := tools.NewRegistryWithOptions(c.st, wss, b, tools.RegistryOptions{})
+	reg, err := tools.NewRegistryWithOptions(c.st, wss, b, tools.RegistryOptions{Approver: c.gate.Approve})
 	if err != nil {
 		return nil, err
 	}

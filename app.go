@@ -100,3 +100,7 @@ func (a *App) Send(text string) (string, error) { return a.ctl.Send(a.ctx, text)
 
 // Cancel stops the running turn.
 func (a *App) Cancel() { a.ctl.Cancel() }
+
+// RespondApproval answers a pending approval dialog. decision is "allow", "allow_session" or
+// "deny". Only the human using the window can call this; it is not an agent tool.
+func (a *App) RespondApproval(id, decision string) error { return a.ctl.RespondApproval(id, decision) }

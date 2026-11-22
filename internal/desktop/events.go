@@ -13,6 +13,9 @@ const (
 	EventTurnError    = "turn.error"
 	EventTurnCanceled = "turn.cancelled"
 	EventIndex        = "index.progress"
+
+	EventApprovalRequest  = "approval.request"
+	EventApprovalResolved = "approval.resolved"
 )
 
 // Event is the single JSON payload shape streamed to the UI; which fields are set depends on Type.
@@ -39,6 +42,25 @@ type Event struct {
 	Skipped     int64 `json:"skipped,omitempty"`
 	IndexErrors int64 `json:"indexErrors,omitempty"`
 	Done        bool  `json:"done,omitempty"`
+
+	// approval.request / approval.resolved. Every string here comes from the Go ApprovalRequest,
+	// not from model prose, and is passed through approval.EscapeControl. Sandboxed is omitted
+	// when false, and the UI must treat "absent" as unsandboxed.
+	ApprovalID        string `json:"approvalId,omitempty"`
+	Kind              string `json:"kind,omitempty"` // command | file_create | file_overwrite
+	Command           string `json:"command,omitempty"`
+	Cwd               string `json:"cwd,omitempty"`
+	WorkspaceName     string `json:"workspaceName,omitempty"`
+	WorkspacePath     string `json:"workspacePath,omitempty"` // absolute folder the file goes into
+	DestRelPath       string `json:"destRelPath,omitempty"`
+	SizeBytes         int64  `json:"sizeBytes,omitempty"`
+	ExistingSizeBytes int64  `json:"existingSizeBytes,omitempty"`
+	Preview           string `json:"preview,omitempty"`
+	Sandboxed         bool   `json:"sandboxed,omitempty"`
+	BotName           string `json:"botName,omitempty"`
+	// Decision is set on approval.resolved: "allow", "allow_session", "deny", or "cancelled" when
+	// the turn was stopped (or the app closed) before the user answered.
+	Decision string `json:"decision,omitempty"`
 }
 
 // WorkspaceInfo is a folder the user has attached.

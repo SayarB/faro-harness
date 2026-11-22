@@ -3,7 +3,7 @@
 import * as App from "../../wailsjs/go/main/App";
 import { EventsOn } from "../../wailsjs/runtime/runtime";
 import type { desktop } from "../../wailsjs/go/models";
-import type { FaroEvent } from "./events";
+import type { ApprovalDecision, FaroEvent } from "./events";
 
 export type AppState = desktop.State;
 export type Workspace = desktop.WorkspaceInfo;
@@ -25,6 +25,8 @@ export const bridge = {
   /** Starts a turn and resolves with its id; progress arrives via onEvent. */
   send: (text: string): Promise<string> => App.Send(text),
   cancel: (): Promise<void> => App.Cancel(),
+  /** Answers the pending approval dialog. Human-only: never routed through the model. */
+  respondApproval: (id: string, decision: ApprovalDecision): Promise<void> => App.RespondApproval(id, decision),
   /** Subscribes to the single event stream. Returns an unsubscribe function. */
   onEvent: (cb: (ev: FaroEvent) => void): (() => void) =>
     EventsOn(EVENT_CHANNEL, (ev: FaroEvent) => cb(ev)),

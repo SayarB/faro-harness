@@ -44,6 +44,7 @@ type harness struct {
 	c      *Controller
 	events chan Event
 	dir    string
+	log    []Event // every event received through waitFor, in order
 }
 
 func newHarness(t *testing.T, client llm.Client) *harness {
@@ -80,6 +81,7 @@ func (h *harness) waitFor(t *testing.T, match func(Event) bool) []Event {
 		select {
 		case e := <-h.events:
 			seen = append(seen, e)
+			h.log = append(h.log, e)
 			if match(e) {
 				return seen
 			}
