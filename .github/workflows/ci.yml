@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # macOS so the root Wails package (cgo + native webview) builds without
+    # installing webkit/gtk; free for public repos.
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # caches the module + build cache, keyed on go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install
+        run: npm ci
+        working-directory: frontend
+
+      # frontend/wailsjs is gitignored and imported by the UI, so typecheck needs
+      # generated bindings. The CLI's own deps aren't in go.sum, hence `go install`
+      # (version pinned to the wails module in go.mod). main.go embeds
+      # frontend/dist, so give the generator a placeholder to embed.
+      - name: Generate Wails bindings
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@"$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+          mkdir -p frontend/dist && touch frontend/dist/index.html
+          wails generate module
+
+      - name: Frontend typecheck + build
+        run: npm run build # tsc --noEmit && vite build; also fills frontend/dist for the Go embed
+        working-directory: frontend
+
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build -o /dev/null ./cmd/faro-cli
