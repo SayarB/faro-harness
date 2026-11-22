@@ -4,10 +4,22 @@ Based on `main @ 4264259`. Written as a plan first; implementation status is tra
 
 ## Status
 
-**PR A (first implementation, this branch): chat shell only.**
-- Included: extensible frontend scaffold, chat with token streaming, tool-call UI, create a bot, attach a folder as workspace (with indexing counters), minimal API key entry.
-- Backend work included: `llm.ChatRequest.OnDelta` SSE streaming, `agent.EventToken`, `worker.IndexFolder`, `internal/desktop` controller, Wails bindings.
-- **Deliberately not included yet:** approval dialog (the GUI passes **no approver**, so `deliver_file` and `bot_run_command` are denied by `tools`, which fails closed), file citations/sources panel, conversation history, watcher, keychain, shared `internal/approval` extraction. Each follows as its own PR per the phases below.
+**PR A (first implementation, branch `feat/desktop-chat-ui`): chat shell only. Implemented.**
+
+Included:
+- Extensible frontend scaffold exactly as in section 3: `lib/bridge.ts` (sole Wails importer), `lib/events.ts` (event union), `state/chat.ts` (pure reducer, vitest), `state/store.ts` (Zustand), `styles/index.css` (design tokens + Tailwind v4), `ui/` primitives (Radix dialog), `layout/AppShell` (with an empty right-panel slot), `features/*`.
+- Chat with **token streaming**, a **tool-call card UI** (running/done/failed, expandable request/result), **create a bot** (name + optional instructions), **attach a folder** via the native dialog with indexing counters, minimal API key entry (0600 file in the data dir; `AI_GATEWAY_API_KEY` env wins).
+- Backend: `llm.ChatRequest.OnDelta` SSE streaming (opt-in, existing callers unchanged), `agent.EventToken` + `Event.ToolCallID` (opt-in via `Config.StreamTokens`), `worker.IndexFolder` with progress, `internal/desktop` controller (no Wails import; tested with a fake LLM, `-race`), thin `app.go`.
+
+Deliberately not included yet (each its own PR):
+- **Approval dialog.** The GUI installs **no approver**, so `deliver_file` and `bot_run_command` are denied by `internal/tools` (fails closed). The tool card shows these as "didn't work".
+- File citations / sources panel, conversation history, file watcher, keychain storage, OS sandbox.
+- The shared `internal/approval` extraction and refactoring `cmd/faro-cli` onto the new helpers (the CLI is untouched; it keeps its own approver and indexing code).
+
+Decisions taken against the original recommendations:
+- `frontend/wailsjs/` is **not committed**: the repo's `.gitignore` already excludes it. Run `make bindings` (needs the `wails` CLI) before `npm run build`/`tsc` outside of `wails dev|build`.
+
+How it was verified: see the PR description. Real LLM calls were not made (no gateway key in Infisical); the app was driven end to end in `wails dev -browser` against a local fake OpenAI-compatible SSE server. The native folder dialog was not exercised.
 
 ## Context
 
