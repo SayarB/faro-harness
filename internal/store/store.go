@@ -1,9 +1,12 @@
+// Package store manages the local SQLite (WAL) + FTS5 card catalog.
 package store
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,186 +15,832 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// IndexDepth records how deeply a file has been inspected so the agent knows
-// whether search hits cover full text or only cheap metadata/headers.
-type IndexDepth string
-
 const (
-	DepthMetadataOnly IndexDepth = "metadata_only"
-	DepthHeaderOnly   IndexDepth = "header_only"
-	DepthFull         IndexDepth = "full"
+	DepthFull         = "full"
+	DepthHeaderOnly   = "header_only"
+	DepthMetadataOnly = "metadata_only"
+
+	StatusOK          = "ok"
+	StatusPlaceholder = "placeholder"
+	StatusUnreadable  = "unreadable"
+	StatusTooLarge    = "too_large"
+	StatusError       = "error"
+
+	currentSchemaVersion = 4
 )
 
-// FileRecord mirrors a file on disk (Tier 0 metadata + link to content blob).
+// Workspace represents a registered root folder in the catalog.
+type Workspace struct {
+	ID            int64
+	RootPath      string
+	AddedAt       int64
+	LastScanAt    int64
+	CurrentScanID int64
+}
+
+// ContentBlob holds deduplicated extracted card content keyed by (BLAKE3, PeekerID, PeekerVersion).
+type ContentBlob struct {
+	BLAKE3        string
+	PeekerID      string
+	PeekerVersion int
+	IndexDepth    string
+	Title         string
+	Headings      string
+	BodyPreview   string
+	OutlineJSON   string
+	UnitCount     int
+	ExtractedAt   int64
+}
+
+// FileRecord holds per-path metadata in a workspace.
 type FileRecord struct {
-	ID           int64      `json:"id"`
-	Workspace    string     `json:"workspace"`
-	AbsPath      string     `json:"absPath"`
-	RelPath      string     `json:"relPath"`
-	Folder       string     `json:"folder"`
-	Filename     string     `json:"filename"`
-	Ext          string     `json:"ext"`
-	Size         int64      `json:"size"`
-	MtimeUnixNs  int64      `json:"mtimeUnixNs"`
-	ContentHash  string     `json:"contentHash"`
-	IndexDepth   IndexDepth `json:"indexDepth"`
-	Status       string     `json:"status"`
-	ErrorMessage string     `json:"errorMessage,omitempty"`
-	UpdatedAt    int64      `json:"updatedAt"`
+	ID             int64
+	WorkspaceID    int64
+	RelPath        string
+	Filename       string
+	Folder         string
+	Ext            string
+	Size           int64
+	MtimeNS        int64
+	BLAKE3         string
+	PeekerID       string
+	PeekerVersion  int
+	IndexDepth     string
+	IndexStatus    string
+	ErrorMsg       string
+	IndexedAt      int64
+	LastSeenScanID int64
 }
 
-// BlobRecord stores content-addressed extracted text & structural outline.
-type BlobRecord struct {
-	ContentHash      string     `json:"contentHash"`
-	ExtractorVersion int        `json:"extractorVersion"`
-	IndexDepth       IndexDepth `json:"indexDepth"`
-	Headings         string     `json:"headings"`
-	Body             string     `json:"body"`
-	OutlineJSON      string     `json:"outlineJson"`
-	CreatedAt        int64      `json:"createdAt"`
+// FileMeta is the lightweight projection used for change detection.
+type FileMeta struct {
+	ID             int64
+	Size           int64
+	MtimeNS        int64
+	BLAKE3         string
+	PeekerID       string
+	PeekerVersion  int
+	IndexDepth     string
+	IndexStatus    string
+	LastSeenScanID int64
 }
 
-// SearchHit is returned by FTS5 BM25 queries.
+// UpsertItem bundles a FileRecord and an optional newly extracted ContentBlob.
+type UpsertItem struct {
+	File FileRecord
+	Blob *ContentBlob
+}
+
+// FileEntry joins FileRecord with its ContentBlob (if any) for inspection.
+type FileEntry struct {
+	File FileRecord
+	Blob *ContentBlob
+}
+
+// SearchHit represents a single BM25-ranked FTS5, trigram, or metadata-filter match.
 type SearchHit struct {
-	FileID      int64      `json:"fileId"`
-	AbsPath     string     `json:"absPath"`
-	RelPath     string     `json:"relPath"`
-	Filename    string     `json:"filename"`
-	Folder      string     `json:"folder"`
-	Ext         string     `json:"ext"`
-	Size        int64      `json:"size"`
-	MtimeUnixNs int64      `json:"mtimeUnixNs"`
-	IndexDepth  IndexDepth `json:"indexDepth"`
-	Snippet     string     `json:"snippet"`
-	Score       float64    `json:"score"`
+	FileID      int64
+	WorkspaceID int64
+	RelPath     string
+	Filename    string
+	Folder      string
+	Ext         string
+	Size        int64
+	MtimeNS     int64
+	IndexDepth  string
+	IndexStatus string
+	Title       string
+	Headings    string
+	Snippet     string
+	Rank        float64
+	MatchSource string
 }
 
-// Stats summarizes the current index state for UI status display.
-type Stats struct {
-	TotalFiles   int64            `json:"totalFiles"`
-	TotalBlobs   int64            `json:"totalBlobs"`
-	ByDepth      map[string]int64 `json:"byDepth"`
-	Workspaces   []string         `json:"workspaces"`
-}
-
-// Store wraps an embedded SQLite database (WAL + FTS5).
+// Store wraps SQLite WAL connections for Faro's card catalog.
 type Store struct {
-	db *sql.DB
+	writer *sql.DB
+	reader *sql.DB
+	path   string
+	shared bool
 }
 
-// Open creates or opens the SQLite database at dbPath and runs schema setup.
+const schemaSQL = `
+CREATE TABLE IF NOT EXISTS workspaces (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	root_path       TEXT NOT NULL UNIQUE,
+	added_at        INTEGER NOT NULL,
+	last_scan_at    INTEGER NOT NULL DEFAULT 0,
+	current_scan_id INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS content_blobs (
+	blake3         TEXT NOT NULL,
+	peeker_id      TEXT NOT NULL,
+	peeker_version INTEGER NOT NULL,
+	index_depth    TEXT NOT NULL,
+	title          TEXT NOT NULL DEFAULT '',
+	headings       TEXT NOT NULL DEFAULT '',
+	body_preview   TEXT NOT NULL DEFAULT '',
+	outline_json   TEXT NOT NULL DEFAULT '',
+	unit_count     INTEGER NOT NULL DEFAULT 0,
+	extracted_at   INTEGER NOT NULL,
+	PRIMARY KEY (blake3, peeker_id, peeker_version)
+);
+
+CREATE TABLE IF NOT EXISTS files (
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
+	workspace_id      INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	rel_path          TEXT NOT NULL,
+	filename          TEXT NOT NULL,
+	folder            TEXT NOT NULL,
+	ext               TEXT NOT NULL,
+	size              INTEGER NOT NULL,
+	mtime_ns          INTEGER NOT NULL,
+	blake3            TEXT,
+	peeker_id         TEXT NOT NULL DEFAULT '',
+	peeker_version    INTEGER NOT NULL DEFAULT 0,
+	index_depth       TEXT NOT NULL,
+	index_status      TEXT NOT NULL,
+	error_msg         TEXT NOT NULL DEFAULT '',
+	indexed_at        INTEGER NOT NULL,
+	last_seen_scan_id INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(workspace_id, rel_path),
+	FOREIGN KEY (blake3, peeker_id, peeker_version)
+		REFERENCES content_blobs(blake3, peeker_id, peeker_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_blob ON files(blake3, peeker_id, peeker_version);
+CREATE INDEX IF NOT EXISTS idx_files_workspace_ext ON files(workspace_id, ext);
+CREATE INDEX IF NOT EXISTS idx_files_workspace_scan ON files(workspace_id, last_seen_scan_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+	filename,
+	headings,
+	folder,
+	body,
+	tokenize='porter unicode61 remove_diacritics 2',
+	prefix='2 3'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS files_trigram USING fts5(
+	filename,
+	folder,
+	tokenize='trigram'
+);
+`
+
+// Open opens (or creates) the SQLite catalog at dbPath and applies schema migrations.
+// Pass ":memory:" for an ephemeral in-memory catalog (useful in tests).
 func Open(dbPath string) (*Store, error) {
-	if dbPath != ":memory:" {
+	if dbPath == "" {
+		var err error
+		dbPath, err = DefaultDBPath()
+		if err != nil {
+			return nil, fmt.Errorf("resolve default db path: %w", err)
+		}
+	}
+
+	isMemory := dbPath == ":memory:" || strings.HasPrefix(dbPath, "file::memory:")
+	if !isMemory {
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-			return nil, fmt.Errorf("create db dir: %w", err)
+			return nil, fmt.Errorf("create db directory: %w", err)
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := buildDSN(dbPath, isMemory)
+	writer, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, fmt.Errorf("open sqlite writer: %w", err)
 	}
-	// Single writer connection keeps WAL writes serialized and eliminates SQLITE_BUSY races.
-	db.SetMaxOpenConns(1)
+	writer.SetMaxOpenConns(1)
+	writer.SetMaxIdleConns(1)
 
-	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		_ = db.Close()
-		return nil, err
+	if err := migrateSchema(writer); err != nil {
+		_ = writer.Close()
+		return nil, fmt.Errorf("initialize schema: %w", err)
 	}
-	return s, nil
+
+	if isMemory {
+		return &Store{
+			writer: writer,
+			reader: writer,
+			path:   dbPath,
+			shared: true,
+		}, nil
+	}
+
+	reader, err := sql.Open("sqlite", buildReaderDSN(dbPath))
+	if err != nil {
+		_ = writer.Close()
+		return nil, fmt.Errorf("open sqlite reader: %w", err)
+	}
+	reader.SetMaxOpenConns(4)
+	reader.SetMaxIdleConns(4)
+
+	return &Store{
+		writer: writer,
+		reader: reader,
+		path:   dbPath,
+	}, nil
 }
 
-func (s *Store) Close() error {
-	return s.db.Close()
-}
-
-func (s *Store) migrate() error {
-	stmts := []string{
-		`PRAGMA journal_mode = WAL;`,
-		`PRAGMA synchronous = NORMAL;`,
-		`PRAGMA busy_timeout = 5000;`,
-		`PRAGMA foreign_keys = ON;`,
-		`CREATE TABLE IF NOT EXISTS files (
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			workspace     TEXT NOT NULL,
-			abs_path      TEXT NOT NULL UNIQUE,
-			rel_path      TEXT NOT NULL,
-			folder        TEXT NOT NULL,
-			filename      TEXT NOT NULL,
-			ext           TEXT NOT NULL,
-			size          INTEGER NOT NULL,
-			mtime_unix_ns INTEGER NOT NULL,
-			content_hash  TEXT NOT NULL DEFAULT '',
-			index_depth   TEXT NOT NULL DEFAULT 'metadata_only',
-			status        TEXT NOT NULL DEFAULT 'pending',
-			error_message TEXT NOT NULL DEFAULT '',
-			updated_at    INTEGER NOT NULL
-		);`,
-		`CREATE INDEX IF NOT EXISTS idx_files_workspace ON files(workspace);`,
-		`CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);`,
-		`CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime_unix_ns DESC);`,
-		`CREATE TABLE IF NOT EXISTS blobs (
-			content_hash      TEXT NOT NULL,
-			extractor_version INTEGER NOT NULL,
-			index_depth       TEXT NOT NULL,
-			headings          TEXT NOT NULL DEFAULT '',
-			body              TEXT NOT NULL DEFAULT '',
-			outline_json      TEXT NOT NULL DEFAULT '[]',
-			created_at        INTEGER NOT NULL,
-			PRIMARY KEY (content_hash, extractor_version)
-		);`,
-		`CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
-			filename,
-			folder,
-			headings,
-			body,
-			tokenize = 'porter unicode61'
-		);`,
+func migrateSchema(db *sql.DB) error {
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		return err
 	}
 
-	for _, stmt := range stmts {
-		if _, err := s.db.Exec(stmt); err != nil {
-			return fmt.Errorf("migrate sqlite (%s): %w", stmt[:min(48, len(stmt))], err)
+	if userVersion == 0 {
+		var hasFiles int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'`).Scan(&hasFiles); err != nil {
+			return err
+		}
+		if hasFiles == 0 {
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback() }()
+			if _, err := tx.Exec(schemaSQL); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, currentSchemaVersion)); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}
+		// Legacy unversioned v1 DB: step through v1 -> v2 -> v3.
+		if err := migrateV1ToV2(db); err != nil {
+			return err
+		}
+		userVersion = 2
+	}
+
+	if userVersion < 2 {
+		if err := migrateV1ToV2(db); err != nil {
+			return err
+		}
+		userVersion = 2
+	}
+
+	if userVersion < 3 {
+		if err := migrateV2ToV3(db); err != nil {
+			return err
+		}
+		userVersion = 3
+	}
+
+	if userVersion < 4 {
+		if err := migrateV3ToV4(db); err != nil {
+			return err
 		}
 	}
+
 	return nil
 }
 
-// GetFileByPath looks up an existing file record so unchanged files can be skipped via (size, mtime).
-func (s *Store) GetFileByPath(ctx context.Context, absPath string) (*FileRecord, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT id, workspace, abs_path, rel_path, folder, filename, ext,
-		       size, mtime_unix_ns, content_hash, index_depth, status, error_message, updated_at
-		FROM files WHERE abs_path = ?
-	`, absPath)
+func migrateV1ToV2(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-	var f FileRecord
-	err := row.Scan(
-		&f.ID, &f.Workspace, &f.AbsPath, &f.RelPath, &f.Folder, &f.Filename, &f.Ext,
-		&f.Size, &f.MtimeUnixNs, &f.ContentHash, &f.IndexDepth, &f.Status, &f.ErrorMessage, &f.UpdatedAt,
+	if err := addColumnIfMissing(tx, "workspaces", "current_scan_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(tx, "files", "last_seen_scan_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_files_workspace_scan ON files(workspace_id, last_seen_scan_id)`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS files_fts`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE VIRTUAL TABLE files_fts USING fts5(
+			filename,
+			headings,
+			folder,
+			body,
+			tokenize='porter unicode61 remove_diacritics 2'
+		)
+	`); err != nil {
+		return err
+	}
+
+	insStmt, err := tx.Prepare(`INSERT INTO files_fts (rowid, filename, headings, folder, body) VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insStmt.Close()
+
+	type ftsRow struct {
+		id       int64
+		filename string
+		folder   string
+		title    string
+		headings string
+		body     string
+	}
+
+	const chunkSize = 200
+	var lastID int64
+	for {
+		rows, err := tx.Query(`
+			SELECT f.id, f.filename, f.folder, COALESCE(b.title, ''), COALESCE(b.headings, ''), COALESCE(b.body_preview, '')
+			FROM files f
+			LEFT JOIN content_blobs b ON b.blake3 = f.blake3
+			WHERE f.id > ?
+			ORDER BY f.id
+			LIMIT ?
+		`, lastID, chunkSize)
+		if err != nil {
+			return err
+		}
+		var chunk []ftsRow
+		for rows.Next() {
+			var r ftsRow
+			if err := rows.Scan(&r.id, &r.filename, &r.folder, &r.title, &r.headings, &r.body); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			chunk = append(chunk, r)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(chunk) == 0 {
+			break
+		}
+		for _, r := range chunk {
+			if _, err := insStmt.Exec(r.id, normalizeForFTS(r.filename), combineFTSHeadings(r.title, r.headings), normalizeForFTS(r.folder), r.body); err != nil {
+				return err
+			}
+			lastID = r.id
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV2ToV3 upgrades content_blobs to composite PRIMARY KEY (blake3, peeker_id, peeker_version)
+// and files to composite FOREIGN KEY (blake3, peeker_id, peeker_version), preserving files.id so
+// rowid-keyed files_fts stays aligned.
+// Existing v2 rows receive peeker_id='' (forcing a clean re-peek into the new peeker-scoped cards
+// on the next scan while keeping existing cards searchable immediately).
+func migrateV2ToV3(db *sql.DB) error {
+	// PRAGMA foreign_keys must be toggled outside a transaction.
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer func() { _, _ = db.Exec(`PRAGMA foreign_keys = ON`) }()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Preserve AUTOINCREMENT high-water mark so previously deleted top IDs are not reused.
+	var prevFileSeq int64
+	_ = tx.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name = 'files'`).Scan(&prevFileSeq)
+
+	if _, err := tx.Exec(`
+		CREATE TABLE content_blobs_v3 (
+			blake3         TEXT NOT NULL,
+			peeker_id      TEXT NOT NULL,
+			peeker_version INTEGER NOT NULL,
+			index_depth    TEXT NOT NULL,
+			title          TEXT NOT NULL DEFAULT '',
+			headings       TEXT NOT NULL DEFAULT '',
+			body_preview   TEXT NOT NULL DEFAULT '',
+			outline_json   TEXT NOT NULL DEFAULT '',
+			unit_count     INTEGER NOT NULL DEFAULT 0,
+			extracted_at   INTEGER NOT NULL,
+			PRIMARY KEY (blake3, peeker_id, peeker_version)
+		)
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO content_blobs_v3 (
+			blake3, peeker_id, peeker_version, index_depth, title, headings, body_preview, outline_json, unit_count, extracted_at
+		)
+		SELECT blake3, '', peeker_version, index_depth, title, headings, body_preview, outline_json, unit_count, extracted_at
+		FROM content_blobs
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+		CREATE TABLE files_v3 (
+			id                INTEGER PRIMARY KEY AUTOINCREMENT,
+			workspace_id      INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+			rel_path          TEXT NOT NULL,
+			filename          TEXT NOT NULL,
+			folder            TEXT NOT NULL,
+			ext               TEXT NOT NULL,
+			size              INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			blake3            TEXT,
+			peeker_id         TEXT NOT NULL DEFAULT '',
+			peeker_version    INTEGER NOT NULL DEFAULT 0,
+			index_depth       TEXT NOT NULL,
+			index_status      TEXT NOT NULL,
+			error_msg         TEXT NOT NULL DEFAULT '',
+			indexed_at        INTEGER NOT NULL,
+			last_seen_scan_id INTEGER NOT NULL DEFAULT 0,
+			UNIQUE(workspace_id, rel_path),
+			FOREIGN KEY (blake3, peeker_id, peeker_version)
+				REFERENCES content_blobs(blake3, peeker_id, peeker_version)
+		)
+	`); err != nil {
+		return err
+	}
+
+	// Preserve files.id so rowid-keyed files_fts stays valid. If a legacy file row's
+	// peeker_version ever drifted from its blob's peeker_version, align to the blob's
+	// peeker_version so the composite FK holds cleanly.
+	if _, err := tx.Exec(`
+		INSERT INTO files_v3 (
+			id, workspace_id, rel_path, filename, folder, ext, size, mtime_ns,
+			blake3, peeker_id, peeker_version, index_depth, index_status, error_msg, indexed_at, last_seen_scan_id
+		)
+		SELECT
+			f.id, f.workspace_id, f.rel_path, f.filename, f.folder, f.ext, f.size, f.mtime_ns,
+			CASE WHEN b.blake3 IS NOT NULL THEN f.blake3 ELSE NULL END,
+			'',
+			CASE WHEN b.blake3 IS NOT NULL THEN b.peeker_version ELSE f.peeker_version END,
+			f.index_depth, f.index_status, f.error_msg, f.indexed_at, f.last_seen_scan_id
+		FROM files f
+		LEFT JOIN content_blobs b ON b.blake3 = f.blake3
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`DROP TABLE files`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE content_blobs`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE content_blobs_v3 RENAME TO content_blobs`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE files_v3 RENAME TO files`); err != nil {
+		return err
+	}
+	if prevFileSeq > 0 {
+		res, err := tx.Exec(`UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'files'`, prevFileSeq)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			if _, err := tx.Exec(`INSERT INTO sqlite_sequence (name, seq) VALUES ('files', ?)`, prevFileSeq); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_files_blob ON files(blake3, peeker_id, peeker_version)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_files_workspace_ext ON files(workspace_id, ext)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_files_workspace_scan ON files(workspace_id, last_seen_scan_id)`); err != nil {
+		return err
+	}
+
+	// Verify composite foreign keys before committing.
+	fkRows, err := tx.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	if fkRows.Next() {
+		_ = fkRows.Close()
+		return errors.New("foreign key violation during v2->v3 migration")
+	}
+	if err := fkRows.Close(); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV3ToV4 rebuilds files_fts with prefix='2 3' and upgraded camelCase/digit tokenization,
+// and creates + backfills files_trigram on (filename, folder) keyed by rowid = files.id.
+func migrateV3ToV4(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS files_fts`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE VIRTUAL TABLE files_fts USING fts5(
+			filename,
+			headings,
+			folder,
+			body,
+			tokenize='porter unicode61 remove_diacritics 2',
+			prefix='2 3'
+		)
+	`); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS files_trigram`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE VIRTUAL TABLE files_trigram USING fts5(
+			filename,
+			folder,
+			tokenize='trigram'
+		)
+	`); err != nil {
+		return err
+	}
+
+	insFTSStmt, err := tx.Prepare(`INSERT INTO files_fts (rowid, filename, headings, folder, body) VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insFTSStmt.Close()
+
+	insTriStmt, err := tx.Prepare(`INSERT INTO files_trigram (rowid, filename, folder) VALUES (?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insTriStmt.Close()
+
+	type ftsRow struct {
+		id       int64
+		filename string
+		folder   string
+		title    string
+		headings string
+		body     string
+	}
+
+	const chunkSize = 200
+	var lastID int64
+	for {
+		rows, err := tx.Query(`
+			SELECT f.id, f.filename, f.folder, COALESCE(b.title, ''), COALESCE(b.headings, ''), COALESCE(b.body_preview, '')
+			FROM files f
+			LEFT JOIN content_blobs b
+				ON b.blake3 = f.blake3
+				AND b.peeker_id = f.peeker_id
+				AND b.peeker_version = f.peeker_version
+			WHERE f.id > ?
+			ORDER BY f.id
+			LIMIT ?
+		`, lastID, chunkSize)
+		if err != nil {
+			return err
+		}
+		var chunk []ftsRow
+		for rows.Next() {
+			var r ftsRow
+			if err := rows.Scan(&r.id, &r.filename, &r.folder, &r.title, &r.headings, &r.body); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			chunk = append(chunk, r)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(chunk) == 0 {
+			break
+		}
+		for _, r := range chunk {
+			if _, err := insFTSStmt.Exec(r.id, normalizeForFTS(r.filename), combineFTSHeadings(r.title, r.headings), normalizeForFTS(r.folder), r.body); err != nil {
+				return err
+			}
+			if _, err := insTriStmt.Exec(r.id, r.filename, r.folder); err != nil {
+				return err
+			}
+			lastID = r.id
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 4`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func addColumnIfMissing(tx *sql.Tx, table, column, def string) error {
+	rows, err := tx.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = tx.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, def))
+	return err
+}
+
+func buildDSN(dbPath string, isMemory bool) string {
+	params := url.Values{}
+	params.Add("_pragma", "foreign_keys(ON)")
+	params.Add("_pragma", "busy_timeout(5000)")
+	params.Add("_pragma", "temp_store(MEMORY)")
+	if !isMemory {
+		params.Add("_pragma", "journal_mode(WAL)")
+		params.Add("_pragma", "synchronous(NORMAL)")
+	}
+	return formatSQLiteURI(dbPath, isMemory, params)
+}
+
+func buildReaderDSN(dbPath string) string {
+	params := url.Values{}
+	params.Add("_pragma", "busy_timeout(5000)")
+	params.Add("_pragma", "temp_store(MEMORY)")
+	params.Add("_pragma", "query_only(ON)")
+	return formatSQLiteURI(dbPath, false, params)
+}
+
+func formatSQLiteURI(dbPath string, isMemory bool, params url.Values) string {
+	if strings.HasPrefix(dbPath, "file:") {
+		sep := "?"
+		if strings.Contains(dbPath, "?") {
+			sep = "&"
+		}
+		return dbPath + sep + params.Encode()
+	}
+	if isMemory {
+		return "file::memory:?" + params.Encode()
+	}
+	return "file:" + filepath.ToSlash(dbPath) + "?" + params.Encode()
+}
+
+// Path returns the filesystem path (or ":memory:") backing this Store.
+func (s *Store) Path() string {
+	return s.path
+}
+
+// Close closes the underlying SQLite connections.
+func (s *Store) Close() error {
+	var err1, err2 error
+	if !s.shared && s.reader != nil {
+		err1 = s.reader.Close()
+	}
+	if s.writer != nil {
+		err2 = s.writer.Close()
+	}
+	return errors.Join(err1, err2)
+}
+
+// EnsureWorkspace returns the workspace row for rootPath, creating it if needed.
+func (s *Store) EnsureWorkspace(ctx context.Context, rootPath string) (Workspace, error) {
+	absRoot, err := filepath.Abs(rootPath)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("abs workspace path: %w", err)
+	}
+	now := time.Now().Unix()
+
+	_, err = s.writer.ExecContext(ctx,
+		`INSERT INTO workspaces (root_path, added_at) VALUES (?, ?)
+		 ON CONFLICT(root_path) DO NOTHING`,
+		absRoot, now,
 	)
-	if err == sql.ErrNoRows {
+	if err != nil {
+		return Workspace{}, fmt.Errorf("insert workspace: %w", err)
+	}
+
+	var ws Workspace
+	err = s.writer.QueryRowContext(ctx,
+		`SELECT id, root_path, added_at, last_scan_at, current_scan_id FROM workspaces WHERE root_path = ?`,
+		absRoot,
+	).Scan(&ws.ID, &ws.RootPath, &ws.AddedAt, &ws.LastScanAt, &ws.CurrentScanID)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("query workspace: %w", err)
+	}
+	return ws, nil
+}
+
+// BeginWorkspaceScan atomically increments current_scan_id for workspaceID and returns the new generation.
+func (s *Store) BeginWorkspaceScan(ctx context.Context, workspaceID int64) (int64, error) {
+	var scanID int64
+	err := s.writer.QueryRowContext(ctx,
+		`UPDATE workspaces SET current_scan_id = current_scan_id + 1 WHERE id = ? RETURNING current_scan_id`,
+		workspaceID,
+	).Scan(&scanID)
+	if err != nil {
+		return 0, fmt.Errorf("begin workspace scan: %w", err)
+	}
+	return scanID, nil
+}
+
+// TouchWorkspaceScan updates last_scan_at for a workspace.
+func (s *Store) TouchWorkspaceScan(ctx context.Context, workspaceID int64) error {
+	_, err := s.writer.ExecContext(ctx,
+		`UPDATE workspaces SET last_scan_at = ? WHERE id = ?`,
+		time.Now().Unix(), workspaceID,
+	)
+	return err
+}
+
+// TouchFileScanBatch stamps last_seen_scan_id for unchanged files seen during a workspace scan.
+func (s *Store) TouchFileScanBatch(ctx context.Context, workspaceID int64, scanID int64, relPaths []string) error {
+	if len(relPaths) == 0 || scanID <= 0 {
+		return nil
+	}
+
+	tx, err := s.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin touch scan tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE files
+		SET last_seen_scan_id = MAX(last_seen_scan_id, ?)
+		WHERE workspace_id = ? AND rel_path = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare touch scan: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, rp := range relPaths {
+		if _, err := stmt.ExecContext(ctx, scanID, workspaceID, filepath.ToSlash(rp)); err != nil {
+			return fmt.Errorf("touch scan for %s: %w", rp, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// GetFileMeta looks up existing metadata for a workspace-relative path.
+// Returns (nil, nil) if not found.
+func (s *Store) GetFileMeta(ctx context.Context, workspaceID int64, relPath string) (*FileMeta, error) {
+	var m FileMeta
+	var blake3 sql.NullString
+	err := s.reader.QueryRowContext(ctx,
+		`SELECT id, size, mtime_ns, blake3, peeker_id, peeker_version, index_depth, index_status, last_seen_scan_id
+		 FROM files WHERE workspace_id = ? AND rel_path = ?`,
+		workspaceID, filepath.ToSlash(relPath),
+	).Scan(&m.ID, &m.Size, &m.MtimeNS, &blake3, &m.PeekerID, &m.PeekerVersion, &m.IndexDepth, &m.IndexStatus, &m.LastSeenScanID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &f, nil
+	m.BLAKE3 = blake3.String
+	return &m, nil
 }
 
-// GetBlob checks if content_hash has already been extracted at extractorVersion.
-func (s *Store) GetBlob(ctx context.Context, contentHash string, extractorVersion int) (*BlobRecord, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT content_hash, extractor_version, index_depth, headings, body, outline_json, created_at
-		FROM blobs WHERE content_hash = ? AND extractor_version = ?
-	`, contentHash, extractorVersion)
-
-	var b BlobRecord
-	err := row.Scan(
-		&b.ContentHash, &b.ExtractorVersion, &b.IndexDepth, &b.Headings, &b.Body, &b.OutlineJSON, &b.CreatedAt,
-	)
-	if err == sql.ErrNoRows {
+// GetBlob retrieves a content-addressed blob by its composite key (blake3, peekerID, peekerVersion).
+// Returns (nil, nil) if not found.
+func (s *Store) GetBlob(ctx context.Context, blake3, peekerID string, peekerVersion int) (*ContentBlob, error) {
+	if blake3 == "" {
+		return nil, nil
+	}
+	var b ContentBlob
+	err := s.reader.QueryRowContext(ctx,
+		`SELECT blake3, peeker_id, peeker_version, index_depth, title, headings, body_preview, outline_json, unit_count, extracted_at
+		 FROM content_blobs WHERE blake3 = ? AND peeker_id = ? AND peeker_version = ?`,
+		blake3, peekerID, peekerVersion,
+	).Scan(&b.BLAKE3, &b.PeekerID, &b.PeekerVersion, &b.IndexDepth, &b.Title, &b.Headings, &b.BodyPreview, &b.OutlineJSON, &b.UnitCount, &b.ExtractedAt)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -200,246 +849,538 @@ func (s *Store) GetBlob(ctx context.Context, contentHash string, extractorVersio
 	return &b, nil
 }
 
-// UpsertIndexedFile atomically saves the file record, optional content blob, and FTS5 entry.
-func (s *Store) UpsertIndexedFile(ctx context.Context, f FileRecord, blob *BlobRecord) (int64, error) {
-	now := time.Now().UnixMilli()
-	if f.UpdatedAt == 0 {
-		f.UpdatedAt = now
+// UpsertBatch atomically upserts content_blobs, files, and rowid-keyed files_fts rows in a single transaction.
+func (s *Store) UpsertBatch(ctx context.Context, items []UpsertItem) error {
+	if len(items) == 0 {
+		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("begin upsert tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if blob != nil {
-		if blob.CreatedAt == 0 {
-			blob.CreatedAt = now
-		}
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO blobs (content_hash, extractor_version, index_depth, headings, body, outline_json, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(content_hash, extractor_version) DO UPDATE SET
-				index_depth = excluded.index_depth,
-				headings = excluded.headings,
-				body = excluded.body,
-				outline_json = excluded.outline_json
-		`, blob.ContentHash, blob.ExtractorVersion, blob.IndexDepth, blob.Headings, blob.Body, blob.OutlineJSON, blob.CreatedAt)
-		if err != nil {
-			return 0, fmt.Errorf("upsert blob: %w", err)
-		}
-	}
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO files (workspace, abs_path, rel_path, folder, filename, ext, size, mtime_unix_ns, content_hash, index_depth, status, error_message, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(abs_path) DO UPDATE SET
-			workspace = excluded.workspace,
-			rel_path = excluded.rel_path,
-			folder = excluded.folder,
-			filename = excluded.filename,
-			ext = excluded.ext,
-			size = excluded.size,
-			mtime_unix_ns = excluded.mtime_unix_ns,
-			content_hash = excluded.content_hash,
-			index_depth = excluded.index_depth,
-			status = excluded.status,
-			error_message = excluded.error_message,
-			updated_at = excluded.updated_at
-	`, f.Workspace, f.AbsPath, f.RelPath, f.Folder, f.Filename, f.Ext, f.Size, f.MtimeUnixNs, f.ContentHash, f.IndexDepth, f.Status, f.ErrorMessage, f.UpdatedAt)
+	blobStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO content_blobs (
+			blake3, peeker_id, peeker_version, index_depth, title, headings, body_preview, outline_json, unit_count, extracted_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(blake3, peeker_id, peeker_version) DO UPDATE SET
+			index_depth  = excluded.index_depth,
+			title        = excluded.title,
+			headings     = excluded.headings,
+			body_preview = excluded.body_preview,
+			outline_json = excluded.outline_json,
+			unit_count   = excluded.unit_count,
+			extracted_at = excluded.extracted_at
+	`)
 	if err != nil {
-		return 0, fmt.Errorf("upsert file: %w", err)
+		return fmt.Errorf("prepare blob upsert: %w", err)
 	}
+	defer blobStmt.Close()
 
-	var fileID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM files WHERE abs_path = ?`, f.AbsPath).Scan(&fileID); err != nil {
-		return 0, fmt.Errorf("fetch file id: %w", err)
+	fileStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO files (
+			workspace_id, rel_path, filename, folder, ext, size, mtime_ns,
+			blake3, peeker_id, peeker_version, index_depth, index_status, error_msg, indexed_at, last_seen_scan_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(workspace_id, rel_path) DO UPDATE SET
+			filename          = excluded.filename,
+			folder            = excluded.folder,
+			ext               = excluded.ext,
+			size              = excluded.size,
+			mtime_ns          = excluded.mtime_ns,
+			blake3            = excluded.blake3,
+			peeker_id         = excluded.peeker_id,
+			peeker_version    = excluded.peeker_version,
+			index_depth       = excluded.index_depth,
+			index_status      = excluded.index_status,
+			error_msg         = excluded.error_msg,
+			indexed_at        = excluded.indexed_at,
+			last_seen_scan_id = MAX(files.last_seen_scan_id, excluded.last_seen_scan_id)
+		RETURNING id
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare file upsert: %w", err)
 	}
+	defer fileStmt.Close()
 
-	headings, body := "", ""
-	if blob != nil {
-		headings = blob.Headings
-		body = blob.Body
+	delFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_fts WHERE rowid = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare fts delete: %w", err)
 	}
+	defer delFTSStmt.Close()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM docs_fts WHERE rowid = ?`, fileID); err != nil {
-		return 0, fmt.Errorf("delete fts row: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO docs_fts (rowid, filename, folder, headings, body)
+	insFTSStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO files_fts (rowid, filename, headings, folder, body)
 		VALUES (?, ?, ?, ?, ?)
-	`, fileID, f.Filename, f.Folder, headings, body); err != nil {
-		return 0, fmt.Errorf("insert fts row: %w", err)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare fts insert: %w", err)
+	}
+	defer insFTSStmt.Close()
+
+	delTriStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_trigram WHERE rowid = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare trigram delete: %w", err)
+	}
+	defer delTriStmt.Close()
+
+	insTriStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO files_trigram (rowid, filename, folder)
+		VALUES (?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare trigram insert: %w", err)
+	}
+	defer insTriStmt.Close()
+
+	lookupBlobStmt, err := tx.PrepareContext(ctx, `
+		SELECT title, headings, body_preview
+		FROM content_blobs
+		WHERE blake3 = ? AND peeker_id = ? AND peeker_version = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare blob lookup: %w", err)
+	}
+	defer lookupBlobStmt.Close()
+
+	for _, item := range items {
+		f := item.File
+		f.RelPath = filepath.ToSlash(f.RelPath)
+		f.Folder = filepath.ToSlash(f.Folder)
+
+		var title, headings, body string
+		if item.Blob != nil {
+			b := item.Blob
+			if _, err := blobStmt.ExecContext(ctx,
+				b.BLAKE3, b.PeekerID, b.PeekerVersion, b.IndexDepth, b.Title, b.Headings,
+				b.BodyPreview, b.OutlineJSON, b.UnitCount, b.ExtractedAt,
+			); err != nil {
+				return fmt.Errorf("upsert blob (%s,%s,%d): %w", b.BLAKE3, b.PeekerID, b.PeekerVersion, err)
+			}
+			title, headings, body = b.Title, b.Headings, b.BodyPreview
+		} else if f.BLAKE3 != "" {
+			if err := lookupBlobStmt.QueryRowContext(ctx, f.BLAKE3, f.PeekerID, f.PeekerVersion).Scan(&title, &headings, &body); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("lookup blob (%s,%s,%d): %w", f.BLAKE3, f.PeekerID, f.PeekerVersion, err)
+			}
+		}
+
+		var blake3Param any
+		if f.BLAKE3 != "" {
+			blake3Param = f.BLAKE3
+		}
+
+		var fileID int64
+		if err := fileStmt.QueryRowContext(ctx,
+			f.WorkspaceID, f.RelPath, f.Filename, f.Folder, f.Ext, f.Size, f.MtimeNS,
+			blake3Param, f.PeekerID, f.PeekerVersion, f.IndexDepth, f.IndexStatus, f.ErrorMsg, f.IndexedAt, f.LastSeenScanID,
+		).Scan(&fileID); err != nil {
+			return fmt.Errorf("upsert file %s: %w", f.RelPath, err)
+		}
+
+		if _, err := delFTSStmt.ExecContext(ctx, fileID); err != nil {
+			return fmt.Errorf("delete fts for %s: %w", f.RelPath, err)
+		}
+
+		if _, err := insFTSStmt.ExecContext(ctx,
+			fileID,
+			normalizeForFTS(f.Filename),
+			combineFTSHeadings(title, headings),
+			normalizeForFTS(f.Folder),
+			body,
+		); err != nil {
+			return fmt.Errorf("insert fts for %s: %w", f.RelPath, err)
+		}
+
+		if _, err := delTriStmt.ExecContext(ctx, fileID); err != nil {
+			return fmt.Errorf("delete trigram for %s: %w", f.RelPath, err)
+		}
+		if _, err := insTriStmt.ExecContext(ctx, fileID, f.Filename, f.Folder); err != nil {
+			return fmt.Errorf("insert trigram for %s: %w", f.RelPath, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit upsert tx: %w", err)
+	}
+	return nil
+}
+
+// DeleteFile removes a single file and its FTS entry from a workspace.
+// The associated content_blob is kept for deferred GC so renames hit the cache.
+func (s *Store) DeleteFile(ctx context.Context, workspaceID int64, relPath string) error {
+	return s.DeleteFiles(ctx, workspaceID, []string{relPath})
+}
+
+// DeletePath removes a file at relPath OR all files nested under directory relPath + "/".
+// Returns the number of rows removed.
+func (s *Store) DeletePath(ctx context.Context, workspaceID int64, relPath string) (int, error) {
+	clean := strings.TrimSuffix(filepath.ToSlash(relPath), "/")
+	if clean == "" || clean == "." {
+		return 0, nil
+	}
+
+	tx, err := s.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin delete path tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Use a case-sensitive BINARY range instead of LIKE (SQLite LIKE is ASCII case-insensitive
+	// and cannot use the (workspace_id, rel_path) B-tree index). ASCII '/' is 0x2F and '0' is 0x30.
+	prefixStart := clean + "/"
+	prefixEnd := clean + "0"
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM files WHERE workspace_id = ? AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))`,
+		workspaceID, clean, prefixStart, prefixEnd,
+	)
+	if err != nil {
+		return 0, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	delFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_fts WHERE rowid = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delFTSStmt.Close()
+
+	delTriStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_trigram WHERE rowid = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delTriStmt.Close()
+
+	delFileStmt, err := tx.PrepareContext(ctx, `DELETE FROM files WHERE id = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delFileStmt.Close()
+
+	for _, id := range ids {
+		if _, err := delFTSStmt.ExecContext(ctx, id); err != nil {
+			return 0, err
+		}
+		if _, err := delTriStmt.ExecContext(ctx, id); err != nil {
+			return 0, err
+		}
+		if _, err := delFileStmt.ExecContext(ctx, id); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return fileID, nil
+	return len(ids), nil
 }
 
-// DeleteFileByPath removes a deleted file from both files and docs_fts.
-func (s *Store) DeleteFileByPath(ctx context.Context, absPath string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+// DeleteFiles removes multiple workspace-relative paths and their FTS entries in one transaction.
+func (s *Store) DeleteFiles(ctx context.Context, workspaceID int64, relPaths []string) error {
+	if len(relPaths) == 0 {
+		return nil
+	}
+
+	tx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin delete tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var fileID int64
-	err = tx.QueryRowContext(ctx, `SELECT id FROM files WHERE abs_path = ?`, absPath).Scan(&fileID)
-	if err == sql.ErrNoRows {
-		return nil
-	}
+	findStmt, err := tx.PrepareContext(ctx, `SELECT id FROM files WHERE workspace_id = ? AND rel_path = ?`)
 	if err != nil {
 		return err
 	}
+	defer findStmt.Close()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM docs_fts WHERE rowid = ?`, fileID); err != nil {
+	delFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_fts WHERE rowid = ?`)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM files WHERE id = ?`, fileID); err != nil {
+	defer delFTSStmt.Close()
+
+	delTriStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_trigram WHERE rowid = ?`)
+	if err != nil {
 		return err
 	}
+	defer delTriStmt.Close()
+
+	delFileStmt, err := tx.PrepareContext(ctx, `DELETE FROM files WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer delFileStmt.Close()
+
+	for _, rp := range relPaths {
+		var id int64
+		err := findStmt.QueryRowContext(ctx, workspaceID, filepath.ToSlash(rp)).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := delFTSStmt.ExecContext(ctx, id); err != nil {
+			return err
+		}
+		if _, err := delTriStmt.ExecContext(ctx, id); err != nil {
+			return err
+		}
+		if _, err := delFileStmt.ExecContext(ctx, id); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit()
 }
 
-// Search queries FTS5 with weighted BM25 (filename > headings > folder > body) and returns snippets.
-func (s *Store) Search(ctx context.Context, rawQuery string, limit int) ([]SearchHit, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 25
-	}
-	ftsQuery := SanitizeFTSQuery(rawQuery)
-	if ftsQuery == "" {
-		return s.RecentFiles(ctx, limit)
+// PruneStaleScanFiles deletes rows in workspaceID with last_seen_scan_id < scanID,
+// skipping any path under skipPrefixes (subtrees that errored during the walk).
+func (s *Store) PruneStaleScanFiles(ctx context.Context, workspaceID int64, scanID int64, skipPrefixes []string) (int, error) {
+	if scanID <= 0 {
+		return 0, nil
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT
-			f.id, f.abs_path, f.rel_path, f.filename, f.folder, f.ext,
-			f.size, f.mtime_unix_ns, f.index_depth,
-			snippet(docs_fts, 3, '[', ']', '...', 24) AS preview,
-			bm25(docs_fts, 10.0, 3.0, 5.0, 1.0) AS score
-		FROM docs_fts
-		JOIN files f ON f.id = docs_fts.rowid
-		WHERE docs_fts MATCH ?
-		ORDER BY score ASC, f.mtime_unix_ns DESC
-		LIMIT ?
-	`, ftsQuery, limit)
-	if err != nil {
-		return nil, fmt.Errorf("fts search: %w", err)
-	}
-	defer rows.Close()
-
-	hits := make([]SearchHit, 0)
-	for rows.Next() {
-		var h SearchHit
-		if err := rows.Scan(
-			&h.FileID, &h.AbsPath, &h.RelPath, &h.Filename, &h.Folder, &h.Ext,
-			&h.Size, &h.MtimeUnixNs, &h.IndexDepth, &h.Snippet, &h.Score,
-		); err != nil {
-			return nil, err
+	normSkips := make([]string, 0, len(skipPrefixes))
+	for _, p := range skipPrefixes {
+		clean := strings.TrimSuffix(filepath.ToSlash(p), "/")
+		if clean == "" || clean == "." {
+			return 0, nil
 		}
-		hits = append(hits, h)
+		normSkips = append(normSkips, clean)
 	}
-	return hits, rows.Err()
+
+	tx, err := s.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin prune scan tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, rel_path FROM files WHERE workspace_id = ? AND last_seen_scan_id < ?`,
+		workspaceID, scanID,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	var staleIDs []int64
+	for rows.Next() {
+		var id int64
+		var rp string
+		if err := rows.Scan(&id, &rp); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if hasAnyPrefix(rp, normSkips) {
+			continue
+		}
+		staleIDs = append(staleIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(staleIDs) == 0 {
+		return 0, nil
+	}
+
+	delFTSStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_fts WHERE rowid = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delFTSStmt.Close()
+
+	delTriStmt, err := tx.PrepareContext(ctx, `DELETE FROM files_trigram WHERE rowid = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delTriStmt.Close()
+
+	delFileStmt, err := tx.PrepareContext(ctx, `DELETE FROM files WHERE id = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delFileStmt.Close()
+
+	for _, id := range staleIDs {
+		if _, err := delFTSStmt.ExecContext(ctx, id); err != nil {
+			return 0, err
+		}
+		if _, err := delTriStmt.ExecContext(ctx, id); err != nil {
+			return 0, err
+		}
+		if _, err := delFileStmt.ExecContext(ctx, id); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(staleIDs), nil
 }
 
-// RecentFiles returns the most recently modified files when the query is empty.
-func (s *Store) RecentFiles(ctx context.Context, limit int) ([]SearchHit, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 25
+// DeleteMissing removes any file rows in workspaceID whose rel_path is not in seen.
+func (s *Store) DeleteMissing(ctx context.Context, workspaceID int64, seen map[string]struct{}) (int, error) {
+	rows, err := s.reader.QueryContext(ctx, `SELECT rel_path FROM files WHERE workspace_id = ?`, workspaceID)
+	if err != nil {
+		return 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, abs_path, rel_path, filename, folder, ext, size, mtime_unix_ns, index_depth
-		FROM files
-		ORDER BY mtime_unix_ns DESC
-		LIMIT ?
-	`, limit)
+	var missing []string
+	for rows.Next() {
+		var rp string
+		if err := rows.Scan(&rp); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if _, ok := seen[rp]; !ok {
+			missing = append(missing, rp)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(missing) == 0 {
+		return 0, nil
+	}
+	if err := s.DeleteFiles(ctx, workspaceID, missing); err != nil {
+		return 0, err
+	}
+	return len(missing), nil
+}
+
+// ListFiles returns all indexed files (joined with their content blobs) for a workspace,
+// ordered by rel_path. If workspaceID == 0, lists across all workspaces.
+func (s *Store) ListFiles(ctx context.Context, workspaceID int64) ([]FileEntry, error) {
+	query := `
+		SELECT
+			f.id, f.workspace_id, f.rel_path, f.filename, f.folder, f.ext,
+			f.size, f.mtime_ns, f.blake3, f.peeker_id, f.peeker_version, f.index_depth,
+			f.index_status, f.error_msg, f.indexed_at, f.last_seen_scan_id,
+			b.blake3, b.peeker_id, b.peeker_version, b.index_depth, b.title, b.headings,
+			b.body_preview, b.outline_json, b.unit_count, b.extracted_at
+		FROM files f
+		LEFT JOIN content_blobs b
+			ON b.blake3 = f.blake3
+			AND b.peeker_id = f.peeker_id
+			AND b.peeker_version = f.peeker_version
+	`
+	var args []any
+	if workspaceID > 0 {
+		query += ` WHERE f.workspace_id = ?`
+		args = append(args, workspaceID)
+	}
+	query += ` ORDER BY f.workspace_id, f.rel_path`
+
+	rows, err := s.reader.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	hits := make([]SearchHit, 0)
+	var entries []FileEntry
 	for rows.Next() {
-		var h SearchHit
+		var f FileRecord
+		var fBlake3 sql.NullString
+		var bBlake3, bPeekerID, bDepth, bTitle, bHeadings, bBody, bOutline sql.NullString
+		var bVer, bUnits, bExtracted sql.NullInt64
+
 		if err := rows.Scan(
-			&h.FileID, &h.AbsPath, &h.RelPath, &h.Filename, &h.Folder, &h.Ext,
-			&h.Size, &h.MtimeUnixNs, &h.IndexDepth,
+			&f.ID, &f.WorkspaceID, &f.RelPath, &f.Filename, &f.Folder, &f.Ext,
+			&f.Size, &f.MtimeNS, &fBlake3, &f.PeekerID, &f.PeekerVersion, &f.IndexDepth,
+			&f.IndexStatus, &f.ErrorMsg, &f.IndexedAt, &f.LastSeenScanID,
+			&bBlake3, &bPeekerID, &bVer, &bDepth, &bTitle, &bHeadings,
+			&bBody, &bOutline, &bUnits, &bExtracted,
 		); err != nil {
 			return nil, err
 		}
-		hits = append(hits, h)
-	}
-	return hits, rows.Err()
-}
+		f.BLAKE3 = fBlake3.String
 
-// Stats returns aggregate counts across the local index.
-func (s *Store) Stats(ctx context.Context) (Stats, error) {
-	st := Stats{
-		ByDepth:    make(map[string]int64),
-		Workspaces: make([]string, 0),
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&st.TotalFiles); err != nil {
-		return st, err
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blobs`).Scan(&st.TotalBlobs); err != nil {
-		return st, err
-	}
-
-	depthRows, err := s.db.QueryContext(ctx, `SELECT index_depth, COUNT(*) FROM files GROUP BY index_depth`)
-	if err != nil {
-		return st, err
-	}
-	defer depthRows.Close()
-	for depthRows.Next() {
-		var depth string
-		var count int64
-		if err := depthRows.Scan(&depth, &count); err != nil {
-			return st, err
-		}
-		st.ByDepth[depth] = count
-	}
-
-	wsRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT workspace FROM files ORDER BY workspace`)
-	if err != nil {
-		return st, err
-	}
-	defer wsRows.Close()
-	for wsRows.Next() {
-		var ws string
-		if err := wsRows.Scan(&ws); err != nil {
-			return st, err
-		}
-		st.Workspaces = append(st.Workspaces, ws)
-	}
-	return st, nil
-}
-
-// SanitizeFTSQuery quotes user tokens so punctuation like '-' or ':' cannot trigger FTS5 syntax errors.
-func SanitizeFTSQuery(raw string) string {
-	fields := strings.Fields(strings.TrimSpace(raw))
-	if len(fields) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(fields))
-	for _, tok := range fields {
-		clean := strings.ReplaceAll(tok, `"`, "")
-		clean = strings.TrimSpace(clean)
-		if clean == "" {
-			continue
-		}
-		// Enable prefix search for natural interactive typing when token has >= 2 chars.
-		if len(clean) >= 2 && !strings.HasSuffix(clean, "*") {
-			parts = append(parts, `"`+clean+`"*`)
-		} else {
-			clean = strings.TrimSuffix(clean, "*")
-			if clean != "" {
-				parts = append(parts, `"`+clean+`"`)
+		entry := FileEntry{File: f}
+		if bBlake3.Valid {
+			entry.Blob = &ContentBlob{
+				BLAKE3:        bBlake3.String,
+				PeekerID:      bPeekerID.String,
+				PeekerVersion: int(bVer.Int64),
+				IndexDepth:    bDepth.String,
+				Title:         bTitle.String,
+				Headings:      bHeadings.String,
+				BodyPreview:   bBody.String,
+				OutlineJSON:   bOutline.String,
+				UnitCount:     int(bUnits.Int64),
+				ExtractedAt:   bExtracted.Int64,
 			}
 		}
+		entries = append(entries, entry)
 	}
-	return strings.Join(parts, " ")
+	return entries, rows.Err()
+}
+
+// GCOrphanBlobs deletes content_blobs unreferenced by any file row (matching the composite
+// (blake3, peeker_id, peeker_version) key) and older than cutoff.
+func (s *Store) GCOrphanBlobs(ctx context.Context, olderThan time.Time) (int64, error) {
+	res, err := s.writer.ExecContext(ctx, `
+		DELETE FROM content_blobs
+		WHERE extracted_at <= ?
+		  AND NOT EXISTS (
+		      SELECT 1 FROM files f
+		      WHERE f.blake3 = content_blobs.blake3
+		        AND f.peeker_id = content_blobs.peeker_id
+		        AND f.peeker_version = content_blobs.peeker_version
+		  )
+	`, olderThan.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// BlobCount returns the total number of deduplicated rows in content_blobs.
+func (s *Store) BlobCount(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM content_blobs`).Scan(&n)
+	return n, err
+}
+
+func combineFTSHeadings(title, headings string) string {
+	if title == "" || strings.Contains(headings, title) {
+		return headings
+	}
+	if headings == "" {
+		return title
+	}
+	return title + "\n" + headings
+}
+
+func hasAnyPrefix(relPath string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if relPath == p || strings.HasPrefix(relPath, p+"/") {
+			return true
+		}
+	}
+	return false
 }

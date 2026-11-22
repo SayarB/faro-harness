@@ -1,199 +1,166 @@
+// Package peek extracts fast bounded headers and metadata cards from local files.
 package peek
 
 import (
-	"archive/zip"
-	"encoding/xml"
-	"io"
-	"os"
+	"context"
 	"path/filepath"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/SayarB/faro-harness/internal/store"
 )
 
 const (
-	// ExtractorVersion bumps when peek logic changes so blobs cleanly re-extract.
-	ExtractorVersion = 1
-
-	MaxTextFileBytes = 5 * 1024 * 1024 // skip full-text reading for text files > 5 MB
-	MaxIndexedChars  = 64 * 1024       // cap FTS5 body text at 64 KB (matches OpenCode's MaxText)
-	MaxZipEntries    = 200             // cap central-directory filename list
+	// MaxFullTextBytes is the threshold under which plain-text/Markdown files are indexed as "full".
+	MaxFullTextBytes = 256 * 1024 // 256 KB
+	// MaxHeaderTextBytes is the cap for truncated body previews.
+	MaxHeaderTextBytes = 64 * 1024 // 64 KB
+	// MaxXMLPartBytes bounds uncompressed XML reads inside OOXML containers (zip-bomb guard).
+	MaxXMLPartBytes = 2 * 1024 * 1024 // 2 MB
+	// MaxZipEntries caps how many entry paths are listed from a .zip central directory.
+	MaxZipEntries = 200
+	// MaxPPTXSlides caps how many slides are peeked upfront in a .pptx deck.
+	MaxPPTXSlides = 30
+	// MaxCSVSampleRows caps data rows included in a CSV preview.
+	MaxCSVSampleRows = 25
+	// MaxXLSXSampleRows caps rows peeked from sheet 1 of an .xlsx workbook.
+	MaxXLSXSampleRows = 12
 )
 
-// Result is the compact card extracted from a file without heavy parsing.
+// Result contains the bounded card extracted by a peeker.
 type Result struct {
-	Depth       store.IndexDepth
-	Headings    string
-	Body        string
-	OutlineJSON string
+	PeekerVersion int
+	IndexDepth    string
+	IndexStatus   string
+	Title         string
+	Headings      string
+	BodyPreview   string
+	OutlineJSON   string
+	UnitCount     int
+	ErrorMsg      string
 }
 
-var textExtensions = map[string]bool{
-	".md": true, ".markdown": true, ".txt": true, ".csv": true, ".tsv": true,
-	".json": true, ".yaml": true, ".yml": true, ".toml": true, ".xml": true,
-	".html": true, ".htm": true, ".log": true, ".ini": true, ".env": true,
-	".go": true, ".ts": true, ".tsx": true, ".js": true, ".jsx": true,
-	".py": true, ".rs": true, ".sql": true, ".sh": true, ".css": true,
+var textExts = map[string]struct{}{
+	".txt":  {},
+	".log":  {},
+	".json": {},
+	".yaml": {},
+	".yml":  {},
+	".toml": {},
+	".xml":  {},
+	".ini":  {},
+	".conf": {},
+	".sql":  {},
+	".go":   {},
+	".py":   {},
+	".ts":   {},
+	".tsx":  {},
+	".js":   {},
+	".jsx":  {},
+	".html": {},
+	".css":  {},
+	".sh":   {},
+	".rst":  {},
+	".org":  {},
+	".tex":  {},
 }
 
-// File inspects a file using fast, bounded header peeks.
-// Heavy formats (big PDFs, large spreadsheets, media) are kept lightweight so
-// the agent inspects them on demand via code execution.
-func File(absPath string, size int64) (Result, error) {
-	ext := strings.ToLower(filepath.Ext(absPath))
-
-	switch {
-	case ext == ".xlsx":
-		return peekXLSX(absPath)
-	case ext == ".zip":
-		return peekZip(absPath)
-	case textExtensions[ext]:
-		if size > MaxTextFileBytes {
-			return peekTextHead(absPath)
-		}
-		return peekText(absPath)
+// PeekerIDForExt returns the canonical peeker family identifier for a file extension,
+// or "" if no content peeker is registered.
+func PeekerIDForExt(ext string) string {
+	ext = strings.ToLower(ext)
+	switch ext {
+	case ".md", ".markdown":
+		return "md"
+	case ".csv":
+		return "csv"
+	case ".tsv":
+		return "tsv"
+	case ".xlsx":
+		return "xlsx"
+	case ".pptx":
+		return "pptx"
+	case ".zip":
+		return "zip"
 	default:
+		if _, ok := textExts[ext]; ok {
+			return "text"
+		}
+		return ""
+	}
+}
+
+// IsZipContainer reports whether ext uses a ZIP/OOXML container peeker.
+func IsZipContainer(ext string) bool {
+	switch PeekerIDForExt(ext) {
+	case "zip", "xlsx", "pptx":
+		return true
+	default:
+		return false
+	}
+}
+
+// PeekerVersionForExt returns the current peeker version for a normalized lowercase extension
+// (0 means metadata-only / no content peeker registered).
+func PeekerVersionForExt(ext string) int {
+	if PeekerIDForExt(ext) == "" {
+		return 0
+	}
+	return 1
+}
+
+// IsPeekable reports whether a file extension has an upfront content peeker.
+func IsPeekable(ext string) bool {
+	return PeekerVersionForExt(ext) > 0
+}
+
+// Peek extracts a bounded metadata/header card for path without exceeding format caps.
+// Callers must verify the file is not a cloud placeholder before calling Peek.
+func Peek(ctx context.Context, path string, size int64) Result {
+	if err := ctx.Err(); err != nil {
 		return Result{
-			Depth:       store.DepthMetadataOnly,
-			OutlineJSON: "[]",
-		}, nil
-	}
-}
-
-func peekText(absPath string) (Result, error) {
-	f, err := os.Open(absPath)
-	if err != nil {
-		return Result{}, err
-	}
-	defer f.Close()
-
-	buf, err := io.ReadAll(io.LimitReader(f, MaxIndexedChars))
-	if err != nil {
-		return Result{}, err
-	}
-	if !utf8.Valid(buf) {
-		return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-	}
-
-	text := string(buf)
-	headings := extractMarkdownHeadings(text)
-	return Result{
-		Depth:       store.DepthFull,
-		Headings:    strings.Join(headings, " | "),
-		Body:        text,
-		OutlineJSON: "[]",
-	}, nil
-}
-
-func peekTextHead(absPath string) (Result, error) {
-	f, err := os.Open(absPath)
-	if err != nil {
-		return Result{}, err
-	}
-	defer f.Close()
-
-	buf, err := io.ReadAll(io.LimitReader(f, 8*1024))
-	if err != nil {
-		return Result{}, err
-	}
-	if !utf8.Valid(buf) {
-		return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-	}
-	return Result{
-		Depth:       store.DepthHeaderOnly,
-		Headings:    "large-text-file",
-		Body:        string(buf),
-		OutlineJSON: "[]",
-	}, nil
-}
-
-// peekZip reads ONLY the ZIP central directory at the end of the file (zero decompression).
-func peekZip(absPath string) (Result, error) {
-	zr, err := zip.OpenReader(absPath)
-	if err != nil {
-		return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-	}
-	defer zr.Close()
-
-	limit := min(len(zr.File), MaxZipEntries)
-	names := make([]string, 0, limit)
-	for i := 0; i < limit; i++ {
-		names = append(names, zr.File[i].Name)
-	}
-	body := "Archive entries: " + strings.Join(names, "\n")
-	if len(body) > MaxIndexedChars {
-		body = body[:MaxIndexedChars]
-	}
-	return Result{
-		Depth:       store.DepthHeaderOnly,
-		Headings:    strings.Join(names[:min(20, len(names))], " "),
-		Body:        body,
-		OutlineJSON: "[]",
-	}, nil
-}
-
-type xlsxWorkbook struct {
-	Sheets []struct {
-		Name string `xml:"name,attr"`
-	} `xml:"sheets>sheet"`
-}
-
-// peekXLSX reads ONLY xl/workbook.xml from the .xlsx ZIP container to extract sheet names
-// in ~1ms without parsing hundreds of thousands of worksheet rows.
-func peekXLSX(absPath string) (Result, error) {
-	zr, err := zip.OpenReader(absPath)
-	if err != nil {
-		return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-	}
-	defer zr.Close()
-
-	for _, f := range zr.File {
-		if f.Name != "xl/workbook.xml" {
-			continue
+			IndexDepth:  store.DepthMetadataOnly,
+			IndexStatus: store.StatusError,
+			ErrorMsg:    err.Error(),
 		}
-		rc, err := f.Open()
-		if err != nil {
-			return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-		}
-		defer rc.Close()
+	}
 
-		var wb xlsxWorkbook
-		if err := xml.NewDecoder(io.LimitReader(rc, 512*1024)).Decode(&wb); err != nil {
-			return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-		}
-
-		names := make([]string, 0, len(wb.Sheets))
-		for _, s := range wb.Sheets {
-			if s.Name != "" {
-				names = append(names, s.Name)
-			}
-		}
-		joined := strings.Join(names, ", ")
+	ext := strings.ToLower(filepath.Ext(path))
+	ver := PeekerVersionForExt(ext)
+	if ver == 0 {
 		return Result{
-			Depth:       store.DepthHeaderOnly,
-			Headings:    joined,
-			Body:        "Excel workbook sheets: " + joined,
-			OutlineJSON: "[]",
-		}, nil
-	}
-
-	return Result{Depth: store.DepthMetadataOnly, OutlineJSON: "[]"}, nil
-}
-
-func extractMarkdownHeadings(text string) []string {
-	var out []string
-	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			h := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
-			if h != "" {
-				out = append(out, h)
-				if len(out) >= 30 {
-					break
-				}
-			}
+			PeekerVersion: 0,
+			IndexDepth:    store.DepthMetadataOnly,
+			IndexStatus:   store.StatusOK,
 		}
 	}
-	return out
+
+	var res Result
+	switch ext {
+	case ".md", ".markdown":
+		res = peekMarkdown(ctx, path, size)
+	case ".csv", ".tsv":
+		res = peekCSV(ctx, path, size, ext == ".tsv")
+	case ".xlsx":
+		res = peekXLSX(ctx, path)
+	case ".pptx":
+		res = peekPPTX(ctx, path)
+	case ".zip":
+		res = peekZIP(ctx, path)
+	default:
+		res = peekPlainText(ctx, path, size)
+	}
+	res.PeekerVersion = ver
+	return res
+}
+
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Back up to a valid UTF-8 rune boundary.
+	cut := maxBytes
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return strings.TrimSpace(s[:cut])
 }

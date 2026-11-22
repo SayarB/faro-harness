@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/wailsapp/wails/v2 v2.17.1
-	lukechampine.com/blake3 v1.5.1
+	github.com/zeebo/blake3 v0.2.4
 	modernc.org/sqlite v1.62.0
 )
 
