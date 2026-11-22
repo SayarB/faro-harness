@@ -69,7 +69,8 @@ func (a *App) SaveAPIKey(key string) error { return a.ctl.SaveAPIKey(key) }
 // the user cancelled. Indexing continues in the background and reports index.progress events.
 func (a *App) PickFolder() (*desktop.WorkspaceInfo, error) {
 	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Choose a folder for Faro to work with",
+		Title:                "Choose a folder for Faro to work with",
+		CanCreateDirectories: true, // shows "New Folder" so people can make a home for Faro right here
 	})
 	if err != nil || dir == "" {
 		return nil, err
