@@ -1,8 +1,8 @@
 // The only module that talks to Wails. Everything else imports from here, so swapping the
 // transport (tests, a browser dev mock, a future remote backend) touches one file.
-import * as App from "../../wailsjs/go/main/App";
-import { EventsOn } from "../../wailsjs/runtime/runtime";
-import type { desktop } from "../../wailsjs/go/models";
+import { Events } from "@wailsio/runtime";
+import * as App from "../../bindings/github.com/SayarB/faro-harness/app";
+import type * as desktop from "../../bindings/github.com/SayarB/faro-harness/internal/desktop/models";
 import type { ApprovalDecision, ChatInfo, ChatSummary, FaroEvent, Snapshot } from "./events";
 
 export type AppState = desktop.State;
@@ -26,7 +26,7 @@ export const bridge = {
   openChat: (conversationId: string): Promise<Snapshot> =>
     App.OpenChat(conversationId) as Promise<Snapshot>,
   /** Lists recent single-bot conversations ordered newest first. */
-  listChats: (): Promise<ChatSummary[]> => App.ListChats() as Promise<ChatSummary[]>,
+  listChats: async (): Promise<ChatSummary[]> => ((await App.ListChats()) ?? []) as ChatSummary[],
   /** Starts a turn in conversationId and resolves with its id; progress arrives via onEvent. */
   send: (conversationId: string, text: string): Promise<string> => App.Send(conversationId, text),
   /** Stops the running turn if it belongs to this conversation. */
@@ -35,10 +35,10 @@ export const bridge = {
   respondApproval: (id: string, decision: ApprovalDecision): Promise<void> => App.RespondApproval(id, decision),
   /** Subscribes to the single event stream. Returns an unsubscribe function. */
   onEvent: (cb: (ev: FaroEvent) => void): (() => void) =>
-    EventsOn(EVENT_CHANNEL, (ev: FaroEvent) => cb(ev)),
+    Events.On(EVENT_CHANNEL, (e) => cb(e.data as FaroEvent)),
 };
 
-/** Wails rejects with plain strings; normalise anything thrown into a message. */
+/** Bound calls reject with Error-like objects, but normalise anything thrown into a message. */
 export function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return typeof err === "string" ? err : "Something went wrong.";

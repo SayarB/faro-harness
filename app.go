@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/wailsapp/wails/v3/pkg/application"
 
 	"github.com/SayarB/faro-harness/internal/bot"
 	"github.com/SayarB/faro-harness/internal/desktop"
@@ -14,10 +14,13 @@ import (
 // eventChannel is the single Wails event name carrying desktop.Event payloads to the UI.
 const eventChannel = "faro:event"
 
-// App is the thin Wails shell. All behaviour lives in internal/desktop; this type only adds
-// the Wails-specific pieces (native dialogs, event emission) and exposes bound methods.
+// App is the thin Wails shell, registered as a Wails v3 service. All behaviour lives in
+// internal/desktop; this type only adds the Wails-specific pieces (native dialogs, event
+// emission) and exposes bound methods. main sets app and window right after creating them.
 type App struct {
-	ctx     context.Context
+	ctx     context.Context // valid from ServiceStartup until shutdown
+	app     *application.App
+	window  *application.WebviewWindow
 	st      *store.Store
 	ctl     *desktop.Controller
 	dataDir string
@@ -44,8 +47,8 @@ func NewApp() (*App, error) {
 		Bots:    mgr,
 		DataDir: dataDir,
 		Emit: func(ev desktop.Event) {
-			if a.ctx != nil {
-				runtime.EventsEmit(a.ctx, eventChannel, ev)
+			if a.app != nil {
+				a.app.Event.Emit(eventChannel, ev)
 			}
 		},
 	})
@@ -55,21 +58,24 @@ func NewApp() (*App, error) {
 	return a, nil
 }
 
-func (a *App) startup(ctx context.Context) {
+// ServiceStartup is the Wails v3 replacement for v2's OnStartup.
+func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
 	a.ctx = ctx
 	if srv, err := desktop.StartServer(desktop.DefaultSocketPath(a.dataDir), a.ctl); err != nil {
 		log.Printf("faro socket server disabled: %v", err)
 	} else {
 		a.srv = srv
 	}
+	return nil
 }
 
-func (a *App) shutdown(_ context.Context) {
+// ServiceShutdown is the Wails v3 replacement for v2's OnShutdown.
+func (a *App) ServiceShutdown() error {
 	if a.srv != nil {
 		_ = a.srv.Close()
 	}
 	a.ctl.Shutdown()
-	_ = a.st.Close()
+	return a.st.Close()
 }
 
 // GetState returns the key/folders/bots snapshot.
@@ -81,10 +87,15 @@ func (a *App) SaveAPIKey(key string) error { return a.ctl.SaveAPIKey(key) }
 // PickFolder opens the native folder dialog and attaches the chosen folder. It returns nil if
 // the user cancelled. Indexing continues in the background and reports index.progress events.
 func (a *App) PickFolder() (*desktop.WorkspaceInfo, error) {
-	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
-		Title:                "Choose a folder for Faro to work with",
-		CanCreateDirectories: true, // shows "New Folder" so people can make a home for Faro right here
-	})
+	dlg := a.app.Dialog.OpenFile().
+		SetTitle("Choose a folder for Faro to work with").
+		CanChooseFiles(false).
+		CanChooseDirectories(true).
+		CanCreateDirectories(true) // shows "New Folder" so people can make a home for Faro right here
+	if a.window != nil {
+		dlg.AttachToWindow(a.window)
+	}
+	dir, err := dlg.PromptForSingleSelection()
 	if err != nil || dir == "" {
 		return nil, err
 	}

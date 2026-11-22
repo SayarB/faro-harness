@@ -42,7 +42,7 @@ Not included yet (each its own PR):
 - Keychain storage matters more now: an approved unsandboxed `bot_run_command` can read the plaintext key file `settings.json` in the data dir.
 
 Decisions taken against the original recommendations:
-- `frontend/wailsjs/` is **not committed**: the repo's `.gitignore` already excludes it. Run `make bindings` (needs the `wails` CLI) before `npm run build`/`tsc` outside of `wails dev|build`.
+- `frontend/bindings/` (was `frontend/wailsjs/` under Wails v2) is **not committed**: the repo's `.gitignore` already excludes it. Run `make bindings` (needs the `wails3` CLI) before `npm run build`/`tsc` outside of `wails3 dev|build`.
 
 How it was verified: see the PR description. Real LLM calls were not made (no gateway key in Infisical); the app was driven end to end in `wails dev -browser` against a local fake OpenAI-compatible SSE server. The native folder dialog was not exercised.
 

@@ -63,8 +63,8 @@ export const useStore = create<Store>((set, get) => {
   async function refresh() {
     const s = await bridge.getState();
     set((st) => ({
-      workspaces: s.workspaces,
-      bots: s.bots,
+      workspaces: s.workspaces ?? [],
+      bots: s.bots ?? [],
       botSlug: st.botSlug || s.defaultBot,
       view: s.hasKey ? "chat" : "onboarding",
     }));
