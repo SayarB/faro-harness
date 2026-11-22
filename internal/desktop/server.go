@@ -216,7 +216,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		_ = writeJSONLine(conn, rpcResponse{OK: true, TurnID: turnID})
 
 	case "cancel":
-		s.ctl.Cancel()
+		s.ctl.Cancel(req.ConversationID)
 		_ = writeJSONLine(conn, rpcResponse{OK: true})
 
 	case "respond_approval":

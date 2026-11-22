@@ -220,8 +220,11 @@ export const useStore = create<Store>((set, get) => {
         });
       } catch (err) {
         if (nonce === openNonce) {
+          // An approval that arrived while opening must still reach the user, or its turn stays blocked.
+          const missed = openBuffer;
           openingConvId = null;
           openBuffer = [];
+          set((st) => ({ approval: missed.reduce<PendingApproval | null>((cur, ev) => applyApprovalEvent(cur, ev), st.approval) }));
         }
         fail(err);
       }
@@ -250,8 +253,10 @@ export const useStore = create<Store>((set, get) => {
     },
 
     async cancel() {
+      const convId = get().conversationId;
+      if (!convId) return;
       try {
-        await bridge.cancel();
+        await bridge.cancel(convId);
       } catch (err) {
         fail(err);
       }

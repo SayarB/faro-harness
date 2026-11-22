@@ -97,9 +97,9 @@ func (c *Client) Send(ctx context.Context, convID, text string) (string, error) 
 	return resp.TurnID, nil
 }
 
-// Cancel stops the currently running turn on the desktop host.
-func (c *Client) Cancel(ctx context.Context) error {
-	_, err := c.call(ctx, rpcRequest{Method: "cancel"})
+// Cancel stops the running turn on the desktop host if it belongs to convID.
+func (c *Client) Cancel(ctx context.Context, convID string) error {
+	_, err := c.call(ctx, rpcRequest{Method: "cancel", ConversationID: convID})
 	return err
 }
 
@@ -113,6 +113,7 @@ func (c *Client) RespondApproval(ctx context.Context, approvalID, decision strin
 type Stream struct {
 	conn   net.Conn
 	events chan Event
+	done   chan struct{} // closed by Close so readLoop never blocks on an abandoned events channel
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -157,6 +158,7 @@ func (c *Client) Attach(ctx context.Context, convID string) (Snapshot, *Stream, 
 	st := &Stream{
 		conn:   conn,
 		events: make(chan Event, 64),
+		done:   make(chan struct{}),
 	}
 	go st.readLoop(br)
 	return *resp.Snapshot, st, nil
@@ -179,6 +181,7 @@ func (s *Stream) Close() error {
 		s.mu.Lock()
 		s.closed = true
 		s.mu.Unlock()
+		close(s.done)
 		err = s.conn.Close()
 	})
 	return err
@@ -194,7 +197,11 @@ func (s *Stream) readLoop(br *bufio.Reader) {
 				s.setErr(fmt.Errorf("decode event: %w", uErr))
 				return
 			}
-			s.events <- ev
+			select {
+			case s.events <- ev:
+			case <-s.done:
+				return
+			}
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {

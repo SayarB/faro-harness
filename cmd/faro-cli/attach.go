@@ -127,10 +127,12 @@ func attachInteractive(ctx context.Context, cli *desktop.Client, convID string, 
 	}
 
 	pendingID := ""
+	var promptAt time.Time // when the current approval prompt was printed
 	answeredLocally := map[string]bool{}
 	if pendingReq != nil {
 		pendingID = pendingReq.ApprovalID
 		r.printApproval(*pendingReq, true)
+		promptAt = time.Now()
 	}
 
 	stdinReader := newStdinLineReader(in)
@@ -151,6 +153,7 @@ func attachInteractive(ctx context.Context, cli *desktop.Client, convID string, 
 			case desktop.EventApprovalRequest:
 				pendingID = ev.ApprovalID
 				r.printApproval(ev, true)
+				promptAt = time.Now()
 			case desktop.EventApprovalResolved:
 				if answeredLocally[ev.ApprovalID] {
 					delete(answeredLocally, ev.ApprovalID)
@@ -177,6 +180,15 @@ func attachInteractive(ctx context.Context, cli *desktop.Client, convID string, 
 				return line.err
 			}
 			if pendingID != "" {
+				// A line typed before this prompt was printed was meant for an earlier request
+				// (or was ordinary chat); never let it approve a request the user has not read.
+				if line.readAt.Before(promptAt) {
+					fmt.Fprintln(errOut, "[ignored: typed before this approval prompt appeared; answer it now]")
+					if errors.Is(line.err, io.EOF) {
+						return nil
+					}
+					continue
+				}
 				id := pendingID
 				pendingID = ""
 				answeredLocally[id] = true
@@ -202,7 +214,7 @@ func attachInteractive(ctx context.Context, cli *desktop.Client, convID string, 
 			case "/exit", "/quit":
 				return nil
 			case "/cancel":
-				if err := cli.Cancel(ctx); err != nil {
+				if err := cli.Cancel(ctx, snap.ConversationID); err != nil {
 					fmt.Fprintf(errOut, "cancel error: %v\n", err)
 				}
 			default:

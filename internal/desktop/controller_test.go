@@ -326,7 +326,15 @@ func TestSendRejectsConcurrentTurnAndCancelStopsIt(t *testing.T) {
 	if _, err := h.c.NewChat(context.Background(), DefaultBotSlug); err == nil {
 		t.Fatal("NewChat during a turn must be rejected")
 	}
-	h.c.Cancel()
+	h.c.Cancel(chat2.ConversationID) // another conversation's cancel must not stop this turn
+	select {
+	case e := <-h.events:
+		if isTurnEnd(e) {
+			t.Fatalf("turn in chat1 was stopped by a cancel for chat2: %+v", e)
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+	h.c.Cancel(chat1.ConversationID)
 	evs := h.waitFor(t, isTurnEnd)
 	if evs[len(evs)-1].Type != EventTurnCanceled {
 		t.Fatalf("last=%+v", evs[len(evs)-1])

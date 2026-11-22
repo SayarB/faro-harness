@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/SayarB/faro-harness/internal/agent"
 	"github.com/SayarB/faro-harness/internal/bot"
@@ -805,8 +806,9 @@ func runChat(args []string) error {
 }
 
 type stdinLine struct {
-	text string
-	err  error
+	text   string
+	err    error
+	readAt time.Time // when the line arrived, so callers can tell what was typed before a prompt appeared
 }
 
 // stdinLineReader owns a single goroutine reading lines from r so multiple prompts
@@ -823,7 +825,7 @@ func newStdinLineReader(r io.Reader) *stdinLineReader {
 		for {
 			line, err := br.ReadString('\n')
 			if line != "" || err != nil {
-				sr.lines <- stdinLine{text: line, err: err}
+				sr.lines <- stdinLine{text: line, err: err, readAt: time.Now()}
 			}
 			if err != nil {
 				return

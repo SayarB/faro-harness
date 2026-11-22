@@ -109,7 +109,7 @@ It owns:
 | `CreateBot(name, instructions) Bot` | Calls `bot.Manager.Create`. |
 | `NewChat(botSlug) chatID` | Builds a session with all user workspaces. It is rebuilt on workspace add, as the CLI does, and disabled while a turn is running. |
 | `Send(text) turnID` | Returns immediately and errors if `busy`. |
-| `Cancel()` | Cancels the turn context. |
+| `Cancel(convID)` | Cancels the turn context if the running turn belongs to `convID`; a turn in another conversation is left alone. |
 | `RespondApproval(id, decision)` | Delivers the user's choice to the waiting Gate. |
 
 ### One event channel: `faro:event`
@@ -136,7 +136,7 @@ A `token.delta` type is added later in PR5.
 
 ### Cancellation
 
-- `Cancel()` cancels the turn ctx. `Chat` honours ctx, and `Turn` already persists a "[Turn interrupted…]" note.
+- `Cancel(convID)` cancels the turn ctx when the running turn is in that conversation. `Chat` honours ctx, and `Turn` already persists a "[Turn interrupted…]" note.
 - A pending approval's `Ask` selects on `ctx.Done()` and returns Deny, so cancel and window close never leave a goroutine blocked.
 - Index goroutines hang off an app-level ctx cancelled in `shutdown`, and each has its own cancel for Rescan.
 - The single-turn invariant is enforced in Go, not just by a disabled button.

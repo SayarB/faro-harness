@@ -123,8 +123,8 @@ func (a *App) Send(convID, text string) (string, error) {
 	return a.ctl.Send(a.ctx, convID, text)
 }
 
-// Cancel stops the running turn.
-func (a *App) Cancel() { a.ctl.Cancel() }
+// Cancel stops the running turn if it belongs to convID.
+func (a *App) Cancel(convID string) { a.ctl.Cancel(convID) }
 
 // RespondApproval answers a pending approval dialog. decision is "allow", "allow_session" or
 // "deny". Only the human using the window can call this; it is not an agent tool.

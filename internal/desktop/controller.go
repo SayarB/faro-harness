@@ -568,10 +568,14 @@ func (c *Controller) Send(ctx context.Context, convID, text string) (string, err
 	return id, nil
 }
 
-// Cancel stops the running turn, if any.
-func (c *Controller) Cancel() {
+// Cancel stops the running turn if it belongs to convID. A turn running in another conversation
+// is left alone, so a client attached to an idle thread cannot stop someone else's turn by accident.
+func (c *Controller) Cancel(convID string) {
 	c.mu.Lock()
 	stop := c.turnStop
+	if c.turnConvID != strings.TrimSpace(convID) {
+		stop = nil
+	}
 	c.mu.Unlock()
 	if stop != nil {
 		stop()

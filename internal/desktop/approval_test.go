@@ -149,9 +149,9 @@ func TestApprovalOverwriteNeverSessionApproved(t *testing.T) {
 
 func TestCancelWhilePendingResolvesAsCancelledAndWritesNothing(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("unused")}})
-	root, _ := startChat(t, h, DefaultBotSlug)
+	root, convID := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
-	h.c.Cancel()
+	h.c.Cancel(convID)
 	evs := h.waitFor(t, isTurnEnd)
 	if evs[len(evs)-1].Type != EventTurnCanceled {
 		t.Fatalf("last=%+v", evs[len(evs)-1])
