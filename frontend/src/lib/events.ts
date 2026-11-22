@@ -1,5 +1,6 @@
-// Mirrors internal/desktop/events.go (Event, ChatInfo, ChatSummary, Snapshot). Wails does not
-// generate types for event payloads, so this union is hand-written; keep it in sync with Go.
+// Mirrors internal/desktop/events.go (Event, ChatInfo, ChatSummary, Snapshot). Event payloads are
+// not registered with the Wails binding generator (it would only emit a loose Event model), so
+// this union is hand-written; keep it in sync with Go.
 
 export interface Usage {
   prompt_tokens: number;

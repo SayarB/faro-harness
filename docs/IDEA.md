@@ -97,7 +97,7 @@ Undo is what lets bots earn more freedom. If every change can be reversed, bots 
 
 ## Stack
 
-- **Desktop shell & workers:** **Wails v2** (Go backend + native OS WebView)
+- **Desktop shell & workers:** **Wails v3** (Go backend + native OS WebView)
 - **UI:** **React + TypeScript + Vite**
 - **Storage & Search:** Embedded **SQLite (WAL mode)** + **FTS5** (`porter unicode61`, weighted BM25, `snippet()`)
 - **Deduplication & Watching:** **BLAKE3** streaming hashes + debounced **`fsnotify`**

@@ -4,40 +4,59 @@ import (
 	"embed"
 	"log"
 
-	"github.com/wailsapp/wails/v2"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 //go:embed all:frontend/dist
 var assets embed.FS
 
 func main() {
-	app, err := NewApp()
+	svc, err := NewApp()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = wails.Run(&options.App{
-		Title:     "Faro",
-		Width:     1120,
-		Height:    760,
-		MinWidth:  720,
-		MinHeight: 520,
-		AssetServer: &assetserver.Options{
-			Assets: assets,
+	// Seams for later: a system tray is `app.SystemTray.New()` here, and the built-in updater is
+	// `app.Updater.Init(...)` before app.Run(). For a tray that keeps the indexer alive with no
+	// window, also set ApplicationShouldTerminateAfterLastWindowClosed to false below.
+	app := application.New(application.Options{
+		Name:        "Faro",
+		Description: "Local-first AI harness for your files",
+		Services: []application.Service{
+			application.NewService(svc),
 		},
-		BackgroundColour: &options.RGBA{R: 15, G: 17, B: 23, A: 1},
-		SingleInstanceLock: &options.SingleInstanceLock{
-			UniqueId: "com.faro.harness.desktop",
+		Assets: application.AssetOptions{
+			Handler: application.AssetFileServerFS(assets),
 		},
-		OnStartup:  app.startup,
-		OnShutdown: app.shutdown,
-		Bind: []any{
-			app,
+		Mac: application.MacOptions{
+			// Closing the window quits the app (the Wails v2 behaviour).
+			ApplicationShouldTerminateAfterLastWindowClosed: true,
+		},
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "com.faro.harness.desktop",
+			// A second launch brings the running window to the front.
+			OnSecondInstanceLaunch: func(application.SecondInstanceData) {
+				if w := svc.window; w != nil {
+					w.Show()
+					w.UnMinimise()
+					w.Focus()
+				}
+			},
 		},
 	})
-	if err != nil {
+	svc.app = app
+
+	svc.window = app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Title:            "Faro",
+		Width:            1120,
+		Height:           760,
+		MinWidth:         720,
+		MinHeight:        520,
+		BackgroundColour: application.NewRGB(15, 17, 23),
+		URL:              "/",
+	})
+
+	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}
 }

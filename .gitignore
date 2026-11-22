@@ -1,6 +1,6 @@
 # Go / Wails build artifacts
-/build/bin/
 /bin/
+/.task/
 *.exe
 *.dll
 *.so
@@ -11,7 +11,7 @@
 # Frontend
 /frontend/node_modules/
 /frontend/dist/
-/frontend/wailsjs/
+/frontend/bindings/
 /frontend/package.json.md5
 
 # Local data / SQLite databases
