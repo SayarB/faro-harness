@@ -114,7 +114,7 @@ CREATE VIRTUAL TABLE files_fts USING fts5(
     folder,
     body,
     tokenize='porter unicode61 remove_diacritics 2',
-    prefix='2 3'
+    prefix='3'
 );
 
 CREATE VIRTUAL TABLE files_trigram USING fts5(
@@ -125,9 +125,9 @@ CREATE VIRTUAL TABLE files_trigram USING fts5(
 ```
 
 - **FTS5 synchronization:** Both `files_fts` and `files_trigram` are keyed directly by `rowid = files.id` (O(log N) deletes/updates instead of full-table virtual scans) and managed explicitly inside Go `store` transactions. Schema migrations are tracked atomically via `PRAGMA user_version` (currently `v4`).
-- **Identifier & separator normalization:** When indexing `filename` and `folder` into `files_fts`, `normalizeForFTS` splits separators (`_`, `-`, `.`, `/`, `\`), camelCase (`ClientInvoice`), acronyms (`HTTPServer`), and letter/digit boundaries (`March2026`, `2026Report`) while preserving compact codes (`Q4`, `v2`, `FY26`). Raw `filename` and `folder` are also indexed into `files_trigram` for substring and CJK/non-space-language matching (`≥ 3` runes).
+- **Identifier & separator normalization:** When indexing `filename` and `folder` into `files_fts`, `normalizeForFTS` splits separators (`_`, `-`, `.`, `/`, `\`), camelCase (`ClientInvoice`), acronyms (`HTTPServer`, preserving plural acronyms like `PDFs`/`IDs`/`URLs`), and letter/digit boundaries (`March2026`, `2026Report`, `FY2026`) while preserving compact codes (`Q4`, `v2`, `FY26`) and Unicode combining marks (e.g. Indic scripts). Raw `filename` and `folder` are also indexed into `files_trigram` for substring and CJK/non-space-language matching (`≥ 3` runes; note 2-character CJK terms are below SQLite's 3-rune trigram minimum).
 - **Forgiving agent-oriented search (`SearchWithOptions`):**
-  - Default **OR** semantics with English stopword stripping (falling back to original terms if all terms are stopwords) and prefix `*` wildcards gated to `≥ 3`-rune tokens (`prefix='2 3'`), plus opt-in `MatchAll` (strict AND) and `ExactPhrase`.
+  - Default **OR** semantics with English stopword stripping (falling back to original terms if all terms are stopwords), prefix `*` wildcards gated to `≥ 3`-rune tokens (`prefix='3'`), dual compound-token matching (`("ClientInvoice"* OR ("Client"* AND "Invoice"*))`) so camelCase/digit terms hit both raw body text and normalized filenames under `MatchAll`, plus opt-in `MatchAll` (strict AND) and `ExactPhrase`.
   - Weighted BM25 ranking: `bm25(files_fts, 10.0, 5.0, 3.0, 1.0)` (`filename > headings > folder > body`) paired with `snippet(files_fts, -1, '[', ']', '…', 16)`, merged with `files_trigram` (`bm25(files_trigram, 10.0, 3.0)`) and tagged with `MatchSource` (`fts`, `trigram`, `fts+trigram`, or `filter`).
   - Structured metadata filters (`Ext`, `Folder` prefix, `MtimeAfter`/`MtimeBefore`, `IndexDepth`), recency-sorted filter-only queries, and `Truncated` flag (`Limit + 1` fetch).
 - **Orphan blob GC:** `GCOrphanBlobs(olderThan)` removes `content_blobs` unreferenced by any `files` row after a grace period so rename events still hit the blob cache.

@@ -179,7 +179,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
 	folder,
 	body,
 	tokenize='porter unicode61 remove_diacritics 2',
-	prefix='2 3'
+	prefix='3'
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS files_trigram USING fts5(
@@ -540,7 +540,7 @@ func migrateV2ToV3(db *sql.DB) error {
 	return tx.Commit()
 }
 
-// migrateV3ToV4 rebuilds files_fts with prefix='2 3' and upgraded camelCase/digit tokenization,
+// migrateV3ToV4 rebuilds files_fts with prefix='3' and upgraded camelCase/digit tokenization,
 // and creates + backfills files_trigram on (filename, folder) keyed by rowid = files.id.
 func migrateV3ToV4(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -559,7 +559,7 @@ func migrateV3ToV4(db *sql.DB) error {
 			folder,
 			body,
 			tokenize='porter unicode61 remove_diacritics 2',
-			prefix='2 3'
+			prefix='3'
 		)
 	`); err != nil {
 		return err

@@ -32,6 +32,14 @@ type SearchResult struct {
 	TrigramQuery string
 }
 
+// queryUnit represents one user-entered term before identifier splitting so camelCase/letter-digit
+// terms (e.g. "ClientInvoice", "March2026") match BOTH raw body text ("ClientInvoice"*) AND
+// normalized filenames/folders ("Client"* AND "Invoice"*).
+type queryUnit struct {
+	raw   string   // original punctuation-free token (e.g. "ClientInvoice")
+	parts []string // split sub-tokens (e.g. ["Client", "Invoice"])
+}
+
 var englishStopwords = map[string]struct{}{
 	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {},
 	"be": {}, "by": {}, "for": {}, "from": {}, "has": {}, "have": {},
@@ -64,17 +72,28 @@ func (s *Store) SearchWithOptions(ctx context.Context, opts SearchOptions) (Sear
 		opts.Limit = 20
 	}
 
-	rawTerms := collectQueryTerms(opts.Query, opts.Terms)
+	rawQuery := strings.TrimSpace(opts.Query)
 	exactPhrase := strings.TrimSpace(opts.ExactPhrase)
+	hasRawTerms := false
+	for _, t := range opts.Terms {
+		if strings.TrimSpace(t) != "" {
+			hasRawTerms = true
+			break
+		}
+	}
 
-	// Filter-only query (no text terms and no exact phrase): return most recently modified files matching filters.
-	if len(rawTerms) == 0 && exactPhrase == "" {
+	// Only take the filter-only recency path when no text query, terms, or phrase were provided.
+	// Punctuation-only queries (e.g. "!!!", "-") must NOT dump the entire catalog.
+	if rawQuery == "" && !hasRawTerms && exactPhrase == "" {
 		return s.searchFilterOnly(ctx, opts)
 	}
 
-	ftsTerms := stripStopwordsWithFallback(rawTerms)
-	ftsQuery := buildFTSQuery(ftsTerms, exactPhrase, opts.MatchAll)
-	trigramQuery := buildTrigramQuery(ftsTerms, exactPhrase, opts.MatchAll)
+	units := collectQueryUnits(rawQuery, opts.Terms)
+	ftsUnits := stripStopwordUnitsWithFallback(units)
+	ftsQuery := buildFTSQuery(ftsUnits, exactPhrase, opts.MatchAll)
+
+	rawTrigramTerms := collectRawTrigramTerms(rawQuery, opts.Terms)
+	trigramQuery := buildTrigramQuery(rawTrigramTerms, exactPhrase, opts.MatchAll)
 
 	if ftsQuery == "" && trigramQuery == "" {
 		return SearchResult{}, nil
@@ -335,11 +354,15 @@ func mergeSearchHits(ftsHits, trigramHits []SearchHit, limit int) ([]SearchHit, 
 	return merged, truncated
 }
 
-// normalizeForFTS splits separators, camelCase, acronym boundaries (HTTPServer -> HTTP Server),
-// and letter/digit boundaries (March2026 -> March 2026, 2026Report -> 2026 Report) while
-// keeping compact codes like Q4, v2, and FY26 intact.
+func isTokenRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
+}
+
+// normalizeForFTS splits separators, camelCase, acronym boundaries (HTTPServer -> HTTP Server,
+// while preserving plural acronyms like PDFs/IDs/URLs), and letter/digit boundaries
+// (March2026 -> March 2026, 2026Report -> 2026 Report) while preserving compact codes
+// like Q4, v2, and FY26, and keeping Unicode combining marks (e.g. Indic scripts) intact.
 func normalizeForFTS(s string) string {
-	// First split on common path/filename punctuation.
 	var parts []string
 	var cur []rune
 	flush := func() {
@@ -350,7 +373,7 @@ func normalizeForFTS(s string) string {
 	}
 
 	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		if isTokenRune(r) {
 			cur = append(cur, r)
 		} else {
 			flush()
@@ -376,8 +399,12 @@ func splitIdentifierTokens(runes []rune) []string {
 			// camelCase: ClientInvoice -> Client Invoice
 			split = true
 		case unicode.IsUpper(prev) && unicode.IsUpper(curr) && i+1 < len(runes) && unicode.IsLower(runes[i+1]):
-			// Acronym boundary: HTTPServer -> HTTP Server, PDFReport -> PDF Report
-			split = true
+			// Acronym boundary: HTTPServer -> HTTP Server, PDFReport -> PDF Report.
+			// Do NOT split plural acronyms like PDFs, IDs, URLs, URLsList (single trailing lowercase 's').
+			isPluralS := runes[i+1] == 's' && (i+2 == len(runes) || !unicode.IsLower(runes[i+2]))
+			if !isPluralS {
+				split = true
+			}
 		case unicode.IsDigit(prev) && unicode.IsLetter(curr):
 			// Digit to letter: 2026Report -> 2026 Report, Q4Forecast -> Q4 Forecast
 			split = true
@@ -403,41 +430,93 @@ func splitIdentifierTokens(runes []rune) []string {
 	return out
 }
 
-func collectQueryTerms(rawQuery string, extraTerms []string) []string {
-	var all []string
+func collectQueryUnits(rawQuery string, extraTerms []string) []queryUnit {
+	var units []queryUnit
+	seen := make(map[string]struct{})
+
+	addText := func(s string) {
+		var cur []rune
+		flush := func() {
+			if len(cur) == 0 {
+				return
+			}
+			raw := string(cur)
+			cur = cur[:0]
+			lower := strings.ToLower(raw)
+			if _, ok := seen[lower]; ok {
+				return
+			}
+			seen[lower] = struct{}{}
+			units = append(units, queryUnit{
+				raw:   raw,
+				parts: splitIdentifierTokens([]rune(raw)),
+			})
+		}
+		for _, r := range s {
+			if isTokenRune(r) {
+				cur = append(cur, r)
+			} else {
+				flush()
+			}
+		}
+		flush()
+	}
+
+	addText(rawQuery)
+	for _, t := range extraTerms {
+		addText(t)
+	}
+	return units
+}
+
+func stripStopwordUnitsWithFallback(units []queryUnit) []queryUnit {
+	if len(units) == 0 {
+		return nil
+	}
+	filtered := make([]queryUnit, 0, len(units))
+	for _, u := range units {
+		if _, isStop := englishStopwords[strings.ToLower(u.raw)]; !isStop {
+			filtered = append(filtered, u)
+		}
+	}
+	if len(filtered) == 0 {
+		return units
+	}
+	return filtered
+}
+
+func collectRawTrigramTerms(rawQuery string, extraTerms []string) []string {
+	var rawWords []string
 	seen := make(map[string]struct{})
 	add := func(s string) {
-		for _, tok := range strings.Fields(normalizeForFTS(s)) {
-			lower := strings.ToLower(tok)
-			if lower == "" {
+		for _, w := range strings.Fields(s) {
+			w = strings.TrimSpace(strings.ReplaceAll(w, `"`, ""))
+			if w == "" {
 				continue
 			}
+			lower := strings.ToLower(w)
 			if _, ok := seen[lower]; ok {
 				continue
 			}
 			seen[lower] = struct{}{}
-			all = append(all, tok)
+			rawWords = append(rawWords, w)
 		}
 	}
 	add(rawQuery)
 	for _, t := range extraTerms {
 		add(t)
 	}
-	return all
-}
-
-func stripStopwordsWithFallback(terms []string) []string {
-	if len(terms) == 0 {
+	if len(rawWords) == 0 {
 		return nil
 	}
-	filtered := make([]string, 0, len(terms))
-	for _, t := range terms {
-		if _, isStop := englishStopwords[strings.ToLower(t)]; !isStop {
-			filtered = append(filtered, t)
+	filtered := make([]string, 0, len(rawWords))
+	for _, w := range rawWords {
+		if _, isStop := englishStopwords[strings.ToLower(w)]; !isStop {
+			filtered = append(filtered, w)
 		}
 	}
 	if len(filtered) == 0 {
-		return terms
+		return rawWords
 	}
 	return filtered
 }
@@ -454,20 +533,73 @@ func quoteFTSToken(tok string, allowPrefix bool) string {
 }
 
 func quoteFTSPhrase(phrase string) string {
-	cleaned := strings.TrimSpace(normalizeForFTS(phrase))
-	if cleaned == "" {
+	norm := strings.TrimSpace(normalizeForFTS(phrase))
+	if norm == "" {
 		return ""
 	}
-	return `"` + strings.ReplaceAll(cleaned, `"`, " ") + `"`
+	// Preserve raw whitespace-collapsed form alongside normalized form if they differ
+	// (e.g. camelCase inside ExactPhrase matches both raw body text and split filenames).
+	rawWords := extractRawWords(phrase)
+	rawJoined := strings.Join(rawWords, " ")
+	if rawJoined != "" && !strings.EqualFold(rawJoined, norm) {
+		return `("` + rawJoined + `" OR "` + norm + `")`
+	}
+	return `"` + norm + `"`
 }
 
-func buildFTSQuery(terms []string, exactPhrase string, matchAll bool) string {
+func extractRawWords(s string) []string {
+	var words []string
+	var cur []rune
+	for _, r := range s {
+		if isTokenRune(r) {
+			cur = append(cur, r)
+		} else if len(cur) > 0 {
+			words = append(words, string(cur))
+			cur = cur[:0]
+		}
+	}
+	if len(cur) > 0 {
+		words = append(words, string(cur))
+	}
+	return words
+}
+
+func buildUnitFTSExpr(u queryUnit) string {
+	if len(u.parts) <= 1 {
+		return quoteFTSToken(u.raw, true)
+	}
+	// Compound identifier (e.g. ClientInvoice, March2026): match EITHER the unsplit token
+	// in raw body/headings text OR all split pieces in normalized filename/folder.
+	rawTok := quoteFTSToken(u.raw, true)
+	partExprs := make([]string, 0, len(u.parts))
+	for _, p := range u.parts {
+		if q := quoteFTSToken(p, true); q != "" {
+			partExprs = append(partExprs, q)
+		}
+	}
+	if len(partExprs) == 0 {
+		return rawTok
+	}
+	return "(" + rawTok + " OR (" + strings.Join(partExprs, " AND ") + "))"
+}
+
+func buildFTSQuery(units []queryUnit, exactPhrase string, matchAll bool) string {
+	var phraseExpr string
+	if exactPhrase != "" {
+		phraseExpr = quoteFTSPhrase(exactPhrase)
+		// If the caller explicitly requested an ExactPhrase that normalized to nothing
+		// (e.g. "---"), do NOT drop the phrase constraint and return unconstrained hits.
+		if phraseExpr == "" {
+			return ""
+		}
+	}
+
 	var termExpr string
-	if len(terms) > 0 {
-		parts := make([]string, 0, len(terms))
-		for _, t := range terms {
-			if q := quoteFTSToken(t, true); q != "" {
-				parts = append(parts, q)
+	if len(units) > 0 {
+		parts := make([]string, 0, len(units))
+		for _, u := range units {
+			if expr := buildUnitFTSExpr(u); expr != "" {
+				parts = append(parts, expr)
 			}
 		}
 		if len(parts) > 0 {
@@ -479,7 +611,6 @@ func buildFTSQuery(terms []string, exactPhrase string, matchAll bool) string {
 		}
 	}
 
-	phraseExpr := quoteFTSPhrase(exactPhrase)
 	if phraseExpr != "" && termExpr != "" {
 		return "(" + phraseExpr + ") AND (" + termExpr + ")"
 	}
@@ -493,11 +624,11 @@ func buildFTSQuery(terms []string, exactPhrase string, matchAll bool) string {
 // SQLite's trigram tokenizer requires terms of at least 3 runes.
 // When matchAll is true and any required term is shorter than 3 runes, returns "" so
 // trigram search never emits hits that violate MatchAll.
-func buildTrigramQuery(terms []string, exactPhrase string, matchAll bool) string {
+func buildTrigramQuery(rawTerms []string, exactPhrase string, matchAll bool) string {
 	var termExpr string
-	if len(terms) > 0 {
-		parts := make([]string, 0, len(terms))
-		for _, t := range terms {
+	if len(rawTerms) > 0 {
+		parts := make([]string, 0, len(rawTerms))
+		for _, t := range rawTerms {
 			t = strings.ReplaceAll(t, `"`, "")
 			if len([]rune(t)) < 3 {
 				if matchAll {
