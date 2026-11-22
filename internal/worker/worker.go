@@ -126,6 +126,18 @@ func NewCatalogIndexer(ctx context.Context, st *store.Store, rootPath string) (*
 	if err != nil {
 		return nil, err
 	}
+	return NewCatalogIndexerForWorkspace(st, ws)
+}
+
+// NewCatalogIndexerForWorkspace returns a CatalogIndexer bound to an already-registered
+// workspace without issuing an EnsureWorkspace upsert.
+func NewCatalogIndexerForWorkspace(st *store.Store, ws store.Workspace) (*CatalogIndexer, error) {
+	if st == nil {
+		return nil, errors.New("store is required")
+	}
+	if ws.ID <= 0 || strings.TrimSpace(ws.RootPath) == "" {
+		return nil, errors.New("valid workspace is required")
+	}
 	c := &CatalogIndexer{
 		Store:          st,
 		Workspace:      ws,

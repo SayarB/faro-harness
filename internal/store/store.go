@@ -26,13 +26,15 @@ const (
 	StatusTooLarge    = "too_large"
 	StatusError       = "error"
 
-	currentSchemaVersion = 4
+	currentSchemaVersion = 5
 )
 
 // Workspace represents a registered root folder in the catalog.
 type Workspace struct {
 	ID            int64
 	RootPath      string
+	Kind          string
+	BotID         string
 	AddedAt       int64
 	LastScanAt    int64
 	CurrentScanID int64
@@ -128,10 +130,51 @@ const schemaSQL = `
 CREATE TABLE IF NOT EXISTS workspaces (
 	id              INTEGER PRIMARY KEY AUTOINCREMENT,
 	root_path       TEXT NOT NULL UNIQUE,
+	kind            TEXT NOT NULL DEFAULT 'user',
+	bot_id          TEXT NOT NULL DEFAULT '',
 	added_at        INTEGER NOT NULL,
 	last_scan_at    INTEGER NOT NULL DEFAULT 0,
 	current_scan_id INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS bots (
+	id         TEXT PRIMARY KEY,
+	slug       TEXT NOT NULL UNIQUE,
+	name       TEXT NOT NULL,
+	home_path  TEXT NOT NULL UNIQUE,
+	model      TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+	id         TEXT PRIMARY KEY,
+	title      TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_participants (
+	conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	bot_id          TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+	joined_at       INTEGER NOT NULL,
+	PRIMARY KEY (conversation_id, bot_id)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	seq             INTEGER NOT NULL,
+	role            TEXT NOT NULL,
+	bot_id          TEXT NOT NULL DEFAULT '',
+	content         TEXT NOT NULL DEFAULT '',
+	tool_calls_json TEXT NOT NULL DEFAULT '',
+	tool_call_id    TEXT NOT NULL DEFAULT '',
+	tool_name       TEXT NOT NULL DEFAULT '',
+	created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
 
 CREATE TABLE IF NOT EXISTS content_blobs (
 	blake3         TEXT NOT NULL,
@@ -292,6 +335,13 @@ func migrateSchema(db *sql.DB) error {
 
 	if userVersion < 4 {
 		if err := migrateV3ToV4(db); err != nil {
+			return err
+		}
+		userVersion = 4
+	}
+
+	if userVersion < 5 {
+		if err := migrateV4ToV5(db); err != nil {
 			return err
 		}
 	}
@@ -651,6 +701,68 @@ func migrateV3ToV4(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV4ToV5 adds workspace ownership columns (kind, bot_id) and bot/conversation tables.
+func migrateV4ToV5(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := addColumnIfMissing(tx, "workspaces", "kind", "TEXT NOT NULL DEFAULT 'user'"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(tx, "workspaces", "bot_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS bots (
+			id         TEXT PRIMARY KEY,
+			slug       TEXT NOT NULL UNIQUE,
+			name       TEXT NOT NULL,
+			home_path  TEXT NOT NULL UNIQUE,
+			model      TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS conversations (
+			id         TEXT PRIMARY KEY,
+			title      TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS conversation_participants (
+			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			bot_id          TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+			joined_at       INTEGER NOT NULL,
+			PRIMARY KEY (conversation_id, bot_id)
+		);
+
+		CREATE TABLE IF NOT EXISTS messages (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			seq             INTEGER NOT NULL,
+			role            TEXT NOT NULL,
+			bot_id          TEXT NOT NULL DEFAULT '',
+			content         TEXT NOT NULL DEFAULT '',
+			tool_calls_json TEXT NOT NULL DEFAULT '',
+			tool_call_id    TEXT NOT NULL DEFAULT '',
+			tool_name       TEXT NOT NULL DEFAULT '',
+			created_at      INTEGER NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`PRAGMA user_version = 5`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func addColumnIfMissing(tx *sql.Tx, table, column, def string) error {
 	rows, err := tx.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
 	if err != nil {
@@ -747,9 +859,9 @@ func (s *Store) EnsureWorkspace(ctx context.Context, rootPath string) (Workspace
 
 	var ws Workspace
 	err = s.writer.QueryRowContext(ctx,
-		`SELECT id, root_path, added_at, last_scan_at, current_scan_id FROM workspaces WHERE root_path = ?`,
+		`SELECT id, root_path, kind, bot_id, added_at, last_scan_at, current_scan_id FROM workspaces WHERE root_path = ?`,
 		absRoot,
-	).Scan(&ws.ID, &ws.RootPath, &ws.AddedAt, &ws.LastScanAt, &ws.CurrentScanID)
+	).Scan(&ws.ID, &ws.RootPath, &ws.Kind, &ws.BotID, &ws.AddedAt, &ws.LastScanAt, &ws.CurrentScanID)
 	if err != nil {
 		return Workspace{}, fmt.Errorf("query workspace: %w", err)
 	}
