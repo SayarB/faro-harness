@@ -35,15 +35,15 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      # frontend/wailsjs is gitignored and imported by the UI, so typecheck needs
+      # frontend/bindings is gitignored and imported by the UI, so typecheck needs
       # generated bindings. The CLI's own deps aren't in go.sum, hence `go install`
       # (version pinned to the wails module in go.mod). main.go embeds
       # frontend/dist, so give the generator a placeholder to embed.
       - name: Generate Wails bindings
         run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@"$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+          go install github.com/wailsapp/wails/v3/cmd/wails3@"$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)"
           mkdir -p frontend/dist && touch frontend/dist/index.html
-          wails generate module
+          wails3 generate bindings -ts -i
 
       - name: Frontend typecheck + build
         run: npm run build # tsc --noEmit && vite build; also fills frontend/dist for the Go embed
