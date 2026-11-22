@@ -4,17 +4,25 @@ Based on `main @ 4264259`. Written as a plan first; implementation status is tra
 
 ## Status
 
-**PR A (first implementation, branch `feat/desktop-chat-ui`): chat shell only. Implemented.**
+**PR A (first implementation, branch `feat/desktop-chat-ui`): chat shell only. Implemented. Approvals were deliberately left out and arrive in PR B below.**
 
 Included:
 - Extensible frontend scaffold exactly as in section 3: `lib/bridge.ts` (sole Wails importer), `lib/events.ts` (event union), `state/chat.ts` (pure reducer, vitest), `state/store.ts` (Zustand), `styles/index.css` (design tokens + Tailwind v4), `ui/` primitives (Radix dialog), `layout/AppShell` (with an empty right-panel slot), `features/*`.
 - Chat with **token streaming**, a **tool-call card UI** (running/done/failed, expandable request/result), **create a bot** (name + optional instructions), **attach a folder** via the native dialog with indexing counters, minimal API key entry (0600 file in the data dir; `AI_GATEWAY_API_KEY` env wins).
 - Backend: `llm.ChatRequest.OnDelta` SSE streaming (opt-in, existing callers unchanged), `agent.EventToken` + `Event.ToolCallID` (opt-in via `Config.StreamTokens`), `worker.IndexFolder` with progress, `internal/desktop` controller (no Wails import; tested with a fake LLM, `-race`), thin `app.go`.
 
-Deliberately not included yet (each its own PR):
-- **Approval dialog.** The GUI installs **no approver**, so `deliver_file` and `bot_run_command` are denied by `internal/tools` (fails closed). The tool card shows these as "didn't work".
+**PR B (branch `feat/desktop-approvals`, stacked on PR A): approval flow. Implemented.**
+
+Included:
+- `internal/approval`: the shared `Gate` (allow flags, per-workspace new-file memory, command session memory, injected `Ask`) and `EscapeControl`. The rule "an unsandboxed command can never be session-approved" lives in the Gate and is tested; `cmd/faro-cli` is now one `Ask` implementation (terminal wording stays there, behaviour unchanged).
+- GUI `Ask` in `internal/desktop`: emits `approval.request`, waits for the bound `RespondApproval(id, decision)`, and resolves as a denial on Cancel or quit. The Gate is installed in `buildSession` and starts fresh on each new chat. Answering is human-only: it is a UI-bound method, never an agent tool.
+- Frontend: approval state (`state/approval.ts`) and `ApprovalDialog` on the Radix `ui/Dialog`. Esc and click-outside mean Deny, focus starts on Deny. A call the user declined is shown as "You declined" on the tool card, not as a failure.
+- Honest wording is driven by `sandboxed` from the Go request: an unsandboxed command shows a banner ("Runs with your full user permissions and network access. Faro does not restrict it.") and has no session option; the "sandboxed" badge shows only when true (never today, there is no OS sandbox). The overwrite dialog says the original is backed up first, which `internal/tools/deliver.go` enforces (a failed or oversized backup aborts the write).
+- One line in `BaseSystemPrompt` telling the model that Faro asks for approval itself, so it should call `deliver_file` directly rather than ask in chat.
+
+Not included yet (each its own PR):
 - File citations / sources panel, conversation history, file watcher, keychain storage, OS sandbox.
-- The shared `internal/approval` extraction and refactoring `cmd/faro-cli` onto the new helpers (the CLI is untouched; it keeps its own approver and indexing code).
+- Keychain storage matters more now: an approved unsandboxed `bot_run_command` can read the plaintext key file `settings.json` in the data dir.
 
 Decisions taken against the original recommendations:
 - `frontend/wailsjs/` is **not committed**: the repo's `.gitignore` already excludes it. Run `make bindings` (needs the `wails` CLI) before `npm run build`/`tsc` outside of `wails dev|build`.
