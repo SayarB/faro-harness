@@ -459,3 +459,136 @@ func TestStoreMigratesV3ToV4(t *testing.T) {
 	}
 	_ = st2.Close()
 }
+
+func TestSearchReviewEdgeCases(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ws, err := st.EnsureWorkspace(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().Unix()
+	if err := st.UpsertBatch(ctx, []store.UpsertItem{
+		{
+			// Body contains raw CamelCase & letter+digit identifiers.
+			File: store.FileRecord{
+				WorkspaceID:   ws.ID,
+				RelPath:       "notes/spec.md",
+				Filename:      "spec.md",
+				Folder:        "notes",
+				Ext:           ".md",
+				Size:          100,
+				MtimeNS:       1000,
+				BLAKE3:        "h_spec",
+				PeekerID:      "md",
+				PeekerVersion: 1,
+				IndexDepth:    store.DepthFull,
+				IndexStatus:   store.StatusOK,
+				IndexedAt:     now,
+			},
+			Blob: &store.ContentBlob{
+				BLAKE3:        "h_spec",
+				PeekerID:      "md",
+				PeekerVersion: 1,
+				IndexDepth:    store.DepthFull,
+				BodyPreview:   "References ClientInvoice and March2026 inside body text.",
+				ExtractedAt:   now,
+			},
+		},
+		{
+			// Plural acronym filename (MyPDFs.txt) + Export_final_v2.xlsx + Indic script filename.
+			File: store.FileRecord{
+				WorkspaceID: ws.ID,
+				RelPath:     "docs/MyPDFs.txt",
+				Filename:    "MyPDFs.txt",
+				Folder:      "docs",
+				Ext:         ".txt",
+				Size:        10,
+				MtimeNS:     2000,
+				IndexDepth:  store.DepthMetadataOnly,
+				IndexStatus: store.StatusOK,
+				IndexedAt:   now,
+			},
+		},
+		{
+			File: store.FileRecord{
+				WorkspaceID: ws.ID,
+				RelPath:     "finance/Export_final_v2.xlsx",
+				Filename:    "Export_final_v2.xlsx",
+				Folder:      "finance",
+				Ext:         ".xlsx",
+				Size:        10,
+				MtimeNS:     3000,
+				IndexDepth:  store.DepthMetadataOnly,
+				IndexStatus: store.StatusOK,
+				IndexedAt:   now,
+			},
+		},
+		{
+			File: store.FileRecord{
+				WorkspaceID: ws.ID,
+				RelPath:     "intl/हिन्दी_रिपोर्ट.txt",
+				Filename:    "हिन्दी_रिपोर्ट.txt",
+				Folder:      "intl",
+				Ext:         ".txt",
+				Size:        10,
+				MtimeNS:     4000,
+				IndexDepth:  store.DepthMetadataOnly,
+				IndexStatus: store.StatusOK,
+				IndexedAt:   now,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Body camelCase + letter-digit under MatchAll must find notes/spec.md.
+	for _, q := range []string{"ClientInvoice", "March2026"} {
+		res, err := st.SearchWithOptions(ctx, store.SearchOptions{WorkspaceID: ws.ID, Query: q, MatchAll: true})
+		if err != nil || len(res.Hits) != 1 || res.Hits[0].RelPath != "notes/spec.md" {
+			t.Fatalf("MatchAll(%q) on body = %+v, err=%v", q, res.Hits, err)
+		}
+	}
+
+	// 2. Punctuation-only query must NOT dump the whole catalog.
+	for _, q := range []string{"!!!", "-", "()", "---"} {
+		res, err := st.SearchWithOptions(ctx, store.SearchOptions{WorkspaceID: ws.ID, Query: q})
+		if err != nil || len(res.Hits) != 0 {
+			t.Fatalf("punctuation-only query %q returned %d hits, want 0 (err=%v)", q, len(res.Hits), err)
+		}
+	}
+
+	// 3. Plural acronym MyPDFs.txt must match "pdf" in FTS5 (Porter stems pdfs -> pdf).
+	pdfRes, err := st.SearchWithOptions(ctx, store.SearchOptions{WorkspaceID: ws.ID, Query: "pdf", MatchAll: true})
+	if err != nil || len(pdfRes.Hits) != 1 || pdfRes.Hits[0].RelPath != "docs/MyPDFs.txt" {
+		t.Fatalf("plural acronym search 'pdf' = %+v, err=%v", pdfRes.Hits, err)
+	}
+
+	// 4. Indic script with combining marks must stay intact and match cleanly.
+	indicRes, err := st.SearchWithOptions(ctx, store.SearchOptions{WorkspaceID: ws.ID, Query: "रिपोर्ट", MatchAll: true})
+	if err != nil || len(indicRes.Hits) != 1 || indicRes.Hits[0].RelPath != "intl/हिन्दी_रिपोर्ट.txt" {
+		t.Fatalf("Indic search = %+v, err=%v", indicRes.Hits, err)
+	}
+
+	// 5. Punctuation-only ExactPhrase must NOT be silently dropped when Query is set.
+	badPhrase, err := st.SearchWithOptions(ctx, store.SearchOptions{
+		WorkspaceID: ws.ID,
+		Query:       "ClientInvoice",
+		ExactPhrase: "---",
+	})
+	if err != nil || len(badPhrase.Hits) != 0 {
+		t.Fatalf("ExactPhrase='---' should return 0 hits, got %+v (err=%v)", badPhrase.Hits, err)
+	}
+
+	// 6. Raw literal substring with underscore ("Export_fin") matches Export_final_v2.xlsx via trigram.
+	litRes, err := st.SearchWithOptions(ctx, store.SearchOptions{WorkspaceID: ws.ID, Query: "Export_fin"})
+	if err != nil || len(litRes.Hits) == 0 || litRes.Hits[0].RelPath != "finance/Export_final_v2.xlsx" {
+		t.Fatalf("literal substring 'Export_fin' = %+v, err=%v", litRes.Hits, err)
+	}
+}

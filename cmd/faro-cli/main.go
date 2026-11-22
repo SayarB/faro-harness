@@ -203,10 +203,18 @@ func runSearch(args []string) error {
 	phrase := fs.String("phrase", "", "optional exact phrase match")
 	matchAll := fs.Bool("match-all", false, "require all query terms (AND) instead of OR-by-default")
 	limit := fs.Int("limit", 10, "max search hits")
-	_ = fs.Parse(args)
+	_ = fs.Parse(reorderFlagsFirst(args, map[string]bool{"match-all": true}))
+
+	if *depth != "" {
+		switch *depth {
+		case store.DepthFull, store.DepthHeaderOnly, store.DepthMetadataOnly:
+		default:
+			return fmt.Errorf("invalid --depth %q (want full, header_only, or metadata_only)", *depth)
+		}
+	}
 
 	query := strings.Join(fs.Args(), " ")
-	if query == "" && *phrase == "" && *ext == "" && *subdir == "" && *depth == "" && *folder == "" {
+	if strings.TrimSpace(query) == "" && strings.TrimSpace(*phrase) == "" && *ext == "" && *subdir == "" && *depth == "" && *folder == "" {
 		return errors.New("search query or at least one filter flag is required")
 	}
 
@@ -260,4 +268,29 @@ func runSearch(args []string) error {
 		fmt.Printf("(showing top %d; more results matched)\n", len(res.Hits))
 	}
 	return nil
+}
+
+// reorderFlagsFirst moves CLI flags appearing after positional query terms ahead of
+// positional args so `faro-cli search invoice --ext pdf` parses identically to
+// `faro-cli search --ext pdf invoice`.
+func reorderFlagsFirst(args []string, boolFlags map[string]bool) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") && len(arg) > 1 {
+			flags = append(flags, arg)
+			name := strings.TrimLeft(arg, "-")
+			if !strings.Contains(name, "=") && !boolFlags[name] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
 }
