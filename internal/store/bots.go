@@ -320,7 +320,39 @@ func (s *Store) MaxMessageSeq(ctx context.Context, conversationID string) (int, 
 	return maxSeq, err
 }
 
-// ListConversationsWithBot returns recent single-bot conversations newest first, along with each
+// botChatIDQuery selects the id of a bot's one chat (its most recently updated single-bot
+// conversation). It expects the bot id in a column named p.bot_id of the enclosing query, or a
+// bound parameter when used on its own (see BotConversation).
+const botChatIDQuery = `
+	SELECT c2.id
+	FROM conversations c2
+	JOIN conversation_participants p2 ON p2.conversation_id = c2.id
+	WHERE p2.bot_id = p.bot_id
+	  AND (SELECT COUNT(*) FROM conversation_participants p3 WHERE p3.conversation_id = c2.id) = 1
+	ORDER BY c2.updated_at DESC, c2.id DESC
+	LIMIT 1`
+
+// BotConversation returns the bot's one chat: its most recently updated single-bot conversation,
+// or nil if it has none yet. Older duplicates from before the one-chat-per-bot rule stay in the
+// database but are never returned.
+func (s *Store) BotConversation(ctx context.Context, botID string) (*Conversation, error) {
+	var c Conversation
+	err := s.reader.QueryRowContext(ctx, `
+		SELECT c.id, c.title, c.created_at, c.updated_at
+		FROM conversations c
+		JOIN conversation_participants p ON p.conversation_id = c.id
+		WHERE p.bot_id = ? AND c.id = (`+botChatIDQuery+`)
+	`, botID).Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// ListConversationsWithBot returns each bot's one chat newest first, along with the
 // conversation's bot slug/name and first user message in a single query.
 func (s *Store) ListConversationsWithBot(ctx context.Context, limit int) ([]ConversationSummary, error) {
 	if limit <= 0 {
@@ -342,7 +374,7 @@ func (s *Store) ListConversationsWithBot(ctx context.Context, limit int) ([]Conv
 		FROM conversations c
 		JOIN conversation_participants p ON p.conversation_id = c.id
 		JOIN bots b ON b.id = p.bot_id
-		WHERE (SELECT COUNT(*) FROM conversation_participants p2 WHERE p2.conversation_id = c.id) = 1
+		WHERE c.id = (`+botChatIDQuery+`)
 		ORDER BY c.updated_at DESC, c.id DESC
 		LIMIT ?
 	`, limit)

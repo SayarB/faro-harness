@@ -65,7 +65,7 @@ func runChats(args []string) error {
 func runAttach(args []string) error {
 	fs := flag.NewFlagSet("attach", flag.ExitOnError)
 	sockFlag := fs.String("socket", "", "path to Faro desktop socket (defaults to <dataDir>/run/faro.sock)")
-	botSlug := fs.String("bot", "", "start a new chat with this bot slug on the desktop host")
+	botSlug := fs.String("bot", "", "attach to this bot's chat on the desktop host")
 	_ = fs.Parse(reorderFlagsFirst(args, nil))
 
 	if *botSlug != "" && fs.NArg() > 0 {
@@ -85,7 +85,7 @@ func runAttach(args []string) error {
 	cli := desktop.NewClient(sockPath)
 	convID := ""
 	if *botSlug != "" {
-		info, err := cli.NewChat(ctx, strings.TrimSpace(*botSlug))
+		info, err := cli.BotChat(ctx, strings.TrimSpace(*botSlug))
 		if err != nil {
 			return err
 		}

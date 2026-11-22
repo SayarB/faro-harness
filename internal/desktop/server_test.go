@@ -52,10 +52,10 @@ func TestSocketRoundTripAndApproval(t *testing.T) {
 
 	cli := NewClient(sockPath)
 
-	// new_chat
-	info, err := cli.NewChat(ctx, DefaultBotSlug)
+	// bot_chat
+	info, err := cli.BotChat(ctx, DefaultBotSlug)
 	if err != nil || info.ConversationID == "" || info.BotSlug != DefaultBotSlug {
-		t.Fatalf("NewChat=%+v err=%v", info, err)
+		t.Fatalf("BotChat=%+v err=%v", info, err)
 	}
 
 	// list_chats

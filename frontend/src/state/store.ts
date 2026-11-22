@@ -1,6 +1,6 @@
 // App state (Zustand). Chat/event logic lives in ./chat.ts; this file wires it to the bridge.
 import { create } from "zustand";
-import { bridge, errorMessage, type Bot, type ChatSummary, type Workspace } from "../lib/bridge";
+import { bridge, errorMessage, type Bot, type Workspace } from "../lib/bridge";
 import type { ApprovalDecision, FaroEvent } from "../lib/events";
 import { applyApprovalEvent, type PendingApproval } from "./approval";
 import { applyEvent, emptyChat, isBusy, replaySnapshot, type ChatState } from "./chat";
@@ -19,27 +19,24 @@ interface Store {
   view: View;
   workspaces: Workspace[];
   bots: Bot[];
-  chats: ChatSummary[];
   /** Selected bot slug. Empty only until the first state load picks the default bot. */
   botSlug: string;
-  /** Currently open conversation id, or null for a fresh unsent chat. */
+  /** The selected bot's one conversation id, or null while it is being opened. */
   conversationId: string | null;
   index: Record<number, IndexProgress>;
   chat: ChatState;
   /** The approval dialog's request, if one is waiting for the user (from any conversation). */
   approval: PendingApproval | null;
-  /** True once Go has a session for the current conversation. */
+  /** True once the selected bot's chat is loaded. */
   chatReady: boolean;
   notice: string | null;
 
   init: () => Promise<void>;
-  refreshChats: () => Promise<void>;
   saveKey: (key: string) => Promise<boolean>;
   addFolder: () => Promise<void>;
   rescan: (workspaceId: number) => Promise<void>;
   createBot: (name: string, instructions: string) => Promise<boolean>;
-  selectBot: (slug: string) => void;
-  newChat: () => void;
+  selectBot: (slug: string) => Promise<void>;
   openChat: (conversationId: string) => Promise<void>;
   send: (text: string) => Promise<void>;
   cancel: () => Promise<void>;
@@ -54,11 +51,6 @@ let openNonce = 0;
 
 export const useStore = create<Store>((set, get) => {
   const fail = (err: unknown) => set({ notice: errorMessage(err) });
-
-  async function refreshChats() {
-    const chats = await bridge.listChats();
-    set({ chats });
-  }
 
   async function refresh() {
     const s = await bridge.getState();
@@ -90,9 +82,6 @@ export const useStore = create<Store>((set, get) => {
 
     if (openingConvId !== null && ev.conversationId === openingConvId) {
       openBuffer.push(ev);
-      if (ev.type === "turn.done" || ev.type === "turn.error" || ev.type === "turn.cancelled") {
-        void refreshChats().catch(fail);
-      }
       return;
     }
 
@@ -103,17 +92,12 @@ export const useStore = create<Store>((set, get) => {
           ? st.chat
           : applyEvent(st.chat, ev),
     }));
-
-    if (ev.type === "turn.done" || ev.type === "turn.error" || ev.type === "turn.cancelled") {
-      void refreshChats().catch(fail);
-    }
   }
 
   return {
     view: "loading",
     workspaces: [],
     bots: [],
-    chats: [],
     botSlug: "",
     conversationId: null,
     index: {},
@@ -127,15 +111,7 @@ export const useStore = create<Store>((set, get) => {
       unsubscribe = bridge.onEvent(onEvent);
       try {
         await refresh();
-        await refreshChats();
-      } catch (err) {
-        fail(err);
-      }
-    },
-
-    async refreshChats() {
-      try {
-        await refreshChats();
+        await get().selectBot(get().botSlug);
       } catch (err) {
         fail(err);
       }
@@ -145,7 +121,7 @@ export const useStore = create<Store>((set, get) => {
       try {
         await bridge.saveApiKey(key);
         await refresh();
-        await refreshChats();
+        await get().selectBot(get().botSlug);
         return true;
       } catch (err) {
         fail(err);
@@ -174,7 +150,7 @@ export const useStore = create<Store>((set, get) => {
       try {
         const bot = await bridge.createBot(name, instructions);
         await refresh();
-        get().selectBot(bot.slug);
+        void get().selectBot(bot.slug);
         return true;
       } catch (err) {
         fail(err);
@@ -182,20 +158,20 @@ export const useStore = create<Store>((set, get) => {
       }
     },
 
-    selectBot(slug) {
-      if (isBusy(get().chat)) return;
-      openNonce++;
+    /** Switches to a bot and opens its one chat (created on first use). */
+    async selectBot(slug) {
+      if (!slug || isBusy(get().chat)) return;
+      const nonce = ++openNonce;
       openingConvId = null;
       openBuffer = [];
       set({ botSlug: slug, conversationId: null, chat: emptyChat, chatReady: false });
-    },
-
-    newChat() {
-      if (isBusy(get().chat)) return;
-      openNonce++;
-      openingConvId = null;
-      openBuffer = [];
-      set({ conversationId: null, chat: emptyChat, chatReady: false });
+      try {
+        const info = await bridge.botChat(slug);
+        if (nonce !== openNonce) return;
+        await get().openChat(info.conversationId);
+      } catch (err) {
+        if (nonce === openNonce) fail(err);
+      }
     },
 
     async openChat(conversationId) {
@@ -233,18 +209,8 @@ export const useStore = create<Store>((set, get) => {
     async send(text) {
       const trimmed = text.trim();
       if (!trimmed || isBusy(get().chat)) return;
-      let convId = get().conversationId;
-      if (!convId || !get().chatReady) {
-        try {
-          const info = await bridge.newChat(get().botSlug);
-          convId = info.conversationId;
-          set({ conversationId: convId, chatReady: true });
-          void refreshChats().catch(fail);
-        } catch (err) {
-          fail(err);
-          return;
-        }
-      }
+      const convId = get().conversationId;
+      if (!convId || !get().chatReady) return;
       try {
         await bridge.send(convId, trimmed);
       } catch (err) {

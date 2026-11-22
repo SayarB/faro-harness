@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useBusy, useStore } from "../../state/store";
+import { useStore } from "../../state/store";
 import { Button } from "../../ui/Button";
 import { Composer } from "./Composer";
 import { MessageView } from "./MessageView";
@@ -11,8 +11,6 @@ export function ChatView() {
   const conversationId = useStore((s) => s.conversationId);
   const hasFolder = useStore((s) => s.workspaces.length > 0);
   const addFolder = useStore((s) => s.addFolder);
-  const newChat = useStore((s) => s.newChat);
-  const busy = useBusy();
   const [copied, setCopied] = useState(false);
 
   const title = bots.find((b) => b.slug === botSlug)?.name ?? "Faro";
@@ -59,14 +57,6 @@ export function ChatView() {
             </div>
           ) : null}
         </div>
-        <Button
-          variant="ghost"
-          className="shrink-0 text-xs"
-          onClick={newChat}
-          disabled={busy || (messages.length === 0 && !conversationId)}
-        >
-          New chat
-        </Button>
       </header>
       <div
         ref={scroller}

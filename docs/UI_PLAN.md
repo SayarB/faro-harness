@@ -37,6 +37,13 @@ Included:
 - Frontend: removed optimistic messages (turns start exclusively from `turn.started`), added `openChat` with live-event buffering and `seq <= lastSeq` deduplication, a "Recent chats" list in the sidebar, and a copyable conversation ID in the chat header.
 - **Security & limitations (honest):** socket access control relies solely on filesystem permissions on `<dataDir>/run` (`0700`, same OS user). Any process running as that OS user can connect to the socket, read conversations, send messages, and approve actions. On Windows, POSIX file modes are not enforced. Standalone `faro-cli chat --conv <id>` runs outside the desktop host and is not locked against it, so it can still act as a second writer to a thread the host is running.
 
+**PR E (branch `feat/single-chat-per-bot`): one chat per bot. Implemented.**
+
+- A bot has exactly one conversation. `Controller.BotChat(slug)` returns it, creating it on first use (replaces `NewChat`; the socket RPC `new_chat` is now `bot_chat`). `Store.BotConversation` defines "the bot's chat" as its most recently updated single-bot conversation.
+- The sidebar no longer has "Recent chats" and the chat header no longer has "New chat". Selecting a bot opens its chat. `ListChats` (CLI `faro-cli chats`) returns one row per bot.
+- Schema v6 migration merges a bot's existing single-bot conversations into its oldest one: messages are kept in order (each old conversation stays contiguous, so tool calls and results are not split), `seq` is renumbered, the emptied conversations are deleted, all in one transaction. Bot-less and multi-bot conversations are untouched.
+- Not enforced by a DB constraint, only by the controller, so `faro-cli chat` (standalone) can still create extra conversations.
+
 Not included yet (each its own PR):
 - File citations / sources panel, file watcher, keychain storage, OS sandbox.
 - Keychain storage matters more now: an approved unsandboxed `bot_run_command` can read the plaintext key file `settings.json` in the data dir.

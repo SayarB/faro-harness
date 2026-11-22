@@ -1,4 +1,4 @@
-// Mirrors internal/desktop/events.go (Event, ChatInfo, ChatSummary, Snapshot). Event payloads are
+// Mirrors internal/desktop/events.go (Event, ChatInfo, Snapshot). Event payloads are
 // not registered with the Wails binding generator (it would only emit a loose Event model), so
 // this union is hand-written; keep it in sync with Go.
 
@@ -81,14 +81,6 @@ export type ApprovalDecision = "allow" | "allow_session" | "deny";
 export interface ChatInfo {
   conversationId: string;
   botSlug: string;
-}
-
-export interface ChatSummary {
-  id: string;
-  botSlug: string;
-  botName: string;
-  updatedAt: number;
-  preview: string;
 }
 
 export interface Snapshot {

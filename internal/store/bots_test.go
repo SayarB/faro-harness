@@ -201,3 +201,141 @@ func TestMaxMessageSeqAndListConversationsWithBot(t *testing.T) {
 		t.Fatalf("limited=%+v err=%v", limited, err)
 	}
 }
+
+func TestBotConversationReturnsNewestSingleBotChatOnly(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	b1, _ := st.CreateBot(ctx, store.Bot{ID: "bot_1", Slug: "faro", Name: "Faro", HomePath: "/tmp/faro"})
+	b2, _ := st.CreateBot(ctx, store.Bot{ID: "bot_2", Slug: "ledger", Name: "Ledger", HomePath: "/tmp/ledger"})
+
+	if c, err := st.BotConversation(ctx, b1.ID); err != nil || c != nil {
+		t.Fatalf("no chat yet: got %+v err=%v", c, err)
+	}
+	// Legacy duplicates: two chats for b1; the more recently updated one wins.
+	for _, id := range []string{"old", "new"} {
+		if _, err := st.CreateConversation(ctx, id, "", b1.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.CreateConversation(ctx, "multi", "", b1.ID, b2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendMessages(ctx, "multi", []store.MessageRecord{{Role: "user", Content: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Force "old" to be the most recently updated single-bot chat.
+	if err := st.AppendMessages(ctx, "old", []store.MessageRecord{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := st.BotConversation(ctx, b1.ID)
+	if err != nil || c == nil || c.ID == "multi" {
+		t.Fatalf("got %+v err=%v; must never return a multi-bot conversation", c, err)
+	}
+	list, err := st.ListConversationsWithBot(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, it := range list {
+		if it.BotSlug == "faro" {
+			n++
+			if it.ID != c.ID {
+				t.Fatalf("list returned %s, BotConversation returned %s", it.ID, c.ID)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("list must hold one chat per bot, got %+v", list)
+	}
+}
+
+func TestMigrateV5ToV6MergesEachBotsChatsIntoOne(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v5.db")
+	ctx := context.Background()
+
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, _ := st.CreateBot(ctx, store.Bot{ID: "bot_1", Slug: "quiz", Name: "Quiz", HomePath: "/tmp/quiz"})
+	b2, _ := st.CreateBot(ctx, store.Bot{ID: "bot_2", Slug: "ledger", Name: "Ledger", HomePath: "/tmp/ledger"})
+	for _, id := range []string{"quiz_new", "quiz_old", "ledger_only", "multi"} {
+		bots := []string{b1.ID}
+		if id == "ledger_only" {
+			bots = []string{b2.ID}
+		}
+		if id == "multi" {
+			bots = []string{b1.ID, b2.ID}
+		}
+		if _, err := st.CreateConversation(ctx, id, "", bots...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add := func(conv string, msgs ...store.MessageRecord) {
+		if err := st.AppendMessages(ctx, conv, msgs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("quiz_old", store.MessageRecord{Role: "user", Content: "old q"}, store.MessageRecord{Role: "assistant", Content: "old a"})
+	add("quiz_new", store.MessageRecord{Role: "user", Content: "new q"}, store.MessageRecord{Role: "assistant", Content: "new a"})
+	add("ledger_only", store.MessageRecord{Role: "user", Content: "ledger q"})
+	add("multi", store.MessageRecord{Role: "user", Content: "multi q"})
+	_ = st.Close()
+
+	// Make the data look like a pre-merge v5 database: quiz_old was created first.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`UPDATE conversations SET created_at = 100, updated_at = 150 WHERE id = 'quiz_old'`,
+		`UPDATE conversations SET created_at = 200, updated_at = 250 WHERE id = 'quiz_new'`,
+		`PRAGMA user_version = 5`,
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = raw.Close()
+
+	st, err = store.Open(dbPath) // runs v5 -> v6
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	chat, err := st.BotConversation(ctx, b1.ID)
+	if err != nil || chat == nil || chat.ID != "quiz_old" || chat.UpdatedAt != 250 {
+		t.Fatalf("chat=%+v err=%v; want oldest conversation kept with newest updated_at", chat, err)
+	}
+	msgs, err := st.ListMessages(ctx, "quiz_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for i, m := range msgs {
+		if m.Seq != i+1 {
+			t.Fatalf("seq not renumbered: %+v", msgs)
+		}
+		got = append(got, m.Content)
+	}
+	if want := []string{"old q", "old a", "new q", "new a"}; len(got) != 4 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
+		t.Fatalf("merged messages=%v want %v", got, want)
+	}
+	if c, _ := st.GetConversation(ctx, "quiz_new"); c != nil {
+		t.Fatal("merged-away conversation must be deleted")
+	}
+	// Untouched: another bot's chat and the multi-bot conversation.
+	if m, _ := st.ListMessages(ctx, "ledger_only"); len(m) != 1 {
+		t.Fatalf("ledger_only=%+v", m)
+	}
+	if m, _ := st.ListMessages(ctx, "multi"); len(m) != 1 {
+		t.Fatalf("multi=%+v", m)
+	}
+}
