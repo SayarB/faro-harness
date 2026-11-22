@@ -22,12 +22,15 @@ const (
 	EventToolCall   EventKind = "tool_call"
 	EventToolResult EventKind = "tool_result"
 	EventUsage      EventKind = "usage"
+	EventToken      EventKind = "token" // streamed assistant text fragment (only when Config.StreamTokens)
 )
 
 // Event is emitted to OnEvent observers (CLI logger, future UI stream).
 type Event struct {
 	Kind       EventKind
 	Step       int
+	Text       string // EventToken: the text fragment
+	ToolCallID string // EventToolCall / EventToolResult: pairs a result with its call
 	ToolName   string
 	ToolArgs   string
 	ToolResult string
@@ -48,6 +51,7 @@ type Config struct {
 	MaxSteps       int
 	Now            func() time.Time
 	OnEvent        func(Event)
+	StreamTokens   bool // when true, request streamed replies and emit EventToken fragments
 }
 
 // TurnResult summarizes the outcome of a single user turn.
@@ -69,6 +73,7 @@ type Session struct {
 	model          string
 	maxSteps       int
 	onEvent        func(Event)
+	streamTokens   bool
 	systemPrompt   string
 	history        []llm.Message
 }
@@ -189,6 +194,7 @@ func NewSession(cfg Config) (*Session, error) {
 		model:          model,
 		maxSteps:       maxSteps,
 		onEvent:        cfg.OnEvent,
+		streamTokens:   cfg.StreamTokens,
 		systemPrompt:   sysPrompt,
 		history:        history,
 	}
@@ -275,12 +281,18 @@ func (s *Session) Turn(ctx context.Context, userText string) (TurnResult, error)
 	}
 
 	for step := 1; step <= s.maxSteps; step++ {
-		resp, err := s.client.Chat(ctx, llm.ChatRequest{
+		chatReq := llm.ChatRequest{
 			Model:     s.model,
 			SessionID: s.sessionID,
 			Messages:  s.history,
 			Tools:     toolDefs,
-		})
+		}
+		if s.streamTokens {
+			chatReq.OnDelta = func(text string) {
+				s.emit(Event{Kind: EventToken, Step: step, Text: text})
+			}
+		}
+		resp, err := s.client.Chat(ctx, chatReq)
 		if err != nil {
 			return abortWithPartialSave(err)
 		}
@@ -314,10 +326,11 @@ func (s *Session) Turn(ctx context.Context, userText string) (TurnResult, error)
 		for _, tc := range resp.Message.ToolCalls {
 			toolCallCount++
 			s.emit(Event{
-				Kind:     EventToolCall,
-				Step:     step,
-				ToolName: tc.Name,
-				ToolArgs: tc.Arguments,
+				Kind:       EventToolCall,
+				Step:       step,
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+				ToolArgs:   tc.Arguments,
 			})
 
 			t0 := time.Now()
@@ -352,6 +365,7 @@ func (s *Session) Turn(ctx context.Context, userText string) (TurnResult, error)
 			s.emit(Event{
 				Kind:       EventToolResult,
 				Step:       step,
+				ToolCallID: tc.ID,
 				ToolName:   tc.Name,
 				ToolResult: out,
 				Duration:   dur,

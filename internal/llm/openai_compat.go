@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -105,6 +106,12 @@ type wireChatRequest struct {
 	Tools           []wireTool           `json:"tools,omitempty"`
 	ToolChoice      string               `json:"tool_choice,omitempty"`
 	ProviderOptions *wireProviderOptions `json:"providerOptions,omitempty"`
+	Stream          bool                 `json:"stream,omitempty"`
+	StreamOptions   *wireStreamOptions   `json:"stream_options,omitempty"`
+}
+
+type wireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type wireProviderOptions struct {
@@ -156,17 +163,56 @@ type wireChatResponse struct {
 			ToolCalls []wireToolCall `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens             int `json:"prompt_tokens"`
-		CompletionTokens         int `json:"completion_tokens"`
-		TotalTokens              int `json:"total_tokens"`
-		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		PromptTokensDetails      struct {
-			CachedTokens        int `json:"cached_tokens"`
-			CacheWriteTokens    int `json:"cache_write_tokens"`
-			CacheCreationTokens int `json:"cache_creation_tokens"`
-		} `json:"prompt_tokens_details"`
-	} `json:"usage"`
+	Usage wireUsage     `json:"usage"`
+	Error *wireAPIError `json:"error,omitempty"`
+}
+
+type wireUsage struct {
+	PromptTokens             int `json:"prompt_tokens"`
+	CompletionTokens         int `json:"completion_tokens"`
+	TotalTokens              int `json:"total_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	PromptTokensDetails      struct {
+		CachedTokens        int `json:"cached_tokens"`
+		CacheWriteTokens    int `json:"cache_write_tokens"`
+		CacheCreationTokens int `json:"cache_creation_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func (u wireUsage) toUsage() Usage {
+	cacheWrite := u.CacheCreationInputTokens
+	if cacheWrite == 0 {
+		cacheWrite = u.PromptTokensDetails.CacheWriteTokens
+	}
+	if cacheWrite == 0 {
+		cacheWrite = u.PromptTokensDetails.CacheCreationTokens
+	}
+	return Usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		CachedTokens:     u.PromptTokensDetails.CachedTokens,
+		CacheWriteTokens: cacheWrite,
+	}
+}
+
+type wireStreamChunk struct {
+	Model   string `json:"model"`
+	Choices []struct {
+		FinishReason string `json:"finish_reason"`
+		Delta        struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage *wireUsage    `json:"usage"`
 	Error *wireAPIError `json:"error,omitempty"`
 }
 
@@ -244,6 +290,12 @@ func (c *OpenAICompatClient) Chat(ctx context.Context, req ChatRequest) (ChatRes
 		payload.ToolChoice = "auto"
 	}
 
+	streaming := req.OnDelta != nil
+	if streaming {
+		payload.Stream = true
+		payload.StreamOptions = &wireStreamOptions{IncludeUsage: true}
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal chat request: %w", err)
@@ -272,7 +324,11 @@ func (c *OpenAICompatClient) Chat(ctx context.Context, req ChatRequest) (ChatRes
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if streaming && resp.StatusCode < 400 {
+		return readChatStream(resp.Body, req.OnDelta)
+	}
+
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxChatResponseBytes))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("read llm response: %w", err)
 	}
@@ -311,24 +367,85 @@ func (c *OpenAICompatClient) Chat(ctx context.Context, req ChatRequest) (ChatRes
 		}
 	}
 
-	cacheWriteTokens := parsed.Usage.CacheCreationInputTokens
-	if cacheWriteTokens == 0 {
-		cacheWriteTokens = parsed.Usage.PromptTokensDetails.CacheWriteTokens
-	}
-	if cacheWriteTokens == 0 {
-		cacheWriteTokens = parsed.Usage.PromptTokensDetails.CacheCreationTokens
-	}
-
 	return ChatResponse{
 		Message:      outMsg,
 		FinishReason: choice.FinishReason,
 		Model:        parsed.Model,
-		Usage: Usage{
-			PromptTokens:     parsed.Usage.PromptTokens,
-			CompletionTokens: parsed.Usage.CompletionTokens,
-			TotalTokens:      parsed.Usage.TotalTokens,
-			CachedTokens:     parsed.Usage.PromptTokensDetails.CachedTokens,
-			CacheWriteTokens: cacheWriteTokens,
-		},
+		Usage:        parsed.Usage.toUsage(),
 	}, nil
+}
+
+const maxChatResponseBytes = 4 * 1024 * 1024
+
+// readChatStream assembles a streamed (SSE) chat completion into a ChatResponse,
+// calling onDelta for every text fragment. Tool-call fragments are merged by index.
+func readChatStream(body io.Reader, onDelta func(string)) (ChatResponse, error) {
+	sc := bufio.NewScanner(io.LimitReader(body, maxChatResponseBytes))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var (
+		content strings.Builder
+		calls   []ToolCall
+		out     ChatResponse
+	)
+	out.Message.Role = RoleAssistant
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk wireStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return ChatResponse{}, fmt.Errorf("decode llm stream chunk: %w", err)
+		}
+		if chunk.Error != nil {
+			return ChatResponse{}, fmt.Errorf("llm gateway error: %s", chunk.Error.Message)
+		}
+		if chunk.Model != "" {
+			out.Model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			out.Usage = chunk.Usage.toUsage()
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		if choice.FinishReason != "" {
+			out.FinishReason = choice.FinishReason
+		}
+		if choice.Delta.Content != "" {
+			content.WriteString(choice.Delta.Content)
+			onDelta(choice.Delta.Content)
+		}
+		for _, tc := range choice.Delta.ToolCalls {
+			if tc.Index < 0 || tc.Index > 64 {
+				return ChatResponse{}, fmt.Errorf("llm stream: invalid tool call index %d", tc.Index)
+			}
+			for len(calls) <= tc.Index {
+				calls = append(calls, ToolCall{})
+			}
+			if tc.ID != "" {
+				calls[tc.Index].ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				calls[tc.Index].Name = tc.Function.Name
+			}
+			calls[tc.Index].Arguments += tc.Function.Arguments
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return ChatResponse{}, fmt.Errorf("read llm stream: %w", err)
+	}
+	if content.Len() == 0 && len(calls) == 0 && out.FinishReason == "" {
+		return ChatResponse{}, errors.New("llm stream ended without a response")
+	}
+	out.Message.Content = content.String()
+	out.Message.ToolCalls = calls
+	return out, nil
 }
