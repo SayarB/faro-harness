@@ -1,6 +1,7 @@
 // Pure chat state + reducer. All event handling for a conversation lives here (no React, no
-// Wails) so it is trivially testable and the one place to extend when new event types arrive.
-import type { ChatEvent } from "../lib/events";
+// Wails) so it is trivially testable and identical for UI-started and CLI-started turns.
+import type { ChatEvent, FaroEvent, Snapshot } from "../lib/events";
+import { applyApprovalEvent, type PendingApproval } from "./approval";
 
 export type ToolStatus = "running" | "done" | "error" | "declined";
 
@@ -25,8 +26,7 @@ export interface Message {
   role: "user" | "assistant";
   parts: Part[];
   status: MessageStatus;
-  /** Set on assistant messages once the first event of their turn arrives. */
-  turnId?: string;
+  turnId: string;
   error?: string;
 }
 
@@ -40,42 +40,8 @@ export function isBusy(chat: ChatState): boolean {
   return chat.messages.some((m) => m.role === "assistant" && m.status === "streaming");
 }
 
-/** Adds the user's message and an empty streaming assistant message awaiting its turn id. */
-export function beginTurn(
-  chat: ChatState,
-  text: string,
-  ids: { user: string; assistant: string },
-): ChatState {
-  return {
-    messages: [
-      ...chat.messages,
-      { id: ids.user, role: "user", parts: [{ kind: "text", text }], status: "done" },
-      { id: ids.assistant, role: "assistant", parts: [], status: "streaming" },
-    ],
-  };
-}
-
-/** Marks the not-yet-started assistant message as failed (e.g. Send was rejected). */
-export function failPending(chat: ChatState, error: string): ChatState {
-  return {
-    messages: chat.messages.map((m) =>
-      m.role === "assistant" && m.status === "streaming" && !m.turnId
-        ? { ...m, status: "error" as const, error }
-        : m,
-    ),
-  };
-}
-
-// Events can arrive before the Send() promise resolves, so the first event of a turn claims the
-// newest assistant message that has no turn id yet.
 function locate(messages: Message[], turnId: string): number {
-  const own = messages.findIndex((m) => m.role === "assistant" && m.turnId === turnId);
-  if (own >= 0) return own;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role === "assistant" && m.status === "streaming" && !m.turnId) return i;
-  }
-  return -1;
+  return messages.findIndex((m) => m.role === "assistant" && m.turnId === turnId);
 }
 
 function toolResultFailed(result: string): boolean {
@@ -88,17 +54,40 @@ function toolResultFailed(result: string): boolean {
 }
 
 export function applyEvent(chat: ChatState, ev: ChatEvent): ChatState {
+  if (ev.type === "turn.started") {
+    if (locate(chat.messages, ev.turnId) >= 0) return chat;
+    return {
+      messages: [
+        ...chat.messages,
+        {
+          id: `${ev.turnId}:user`,
+          role: "user",
+          parts: [{ kind: "text", text: ev.text }],
+          status: "done",
+          turnId: ev.turnId,
+        },
+        {
+          id: `${ev.turnId}:assistant`,
+          role: "assistant",
+          parts: [],
+          status: "streaming",
+          turnId: ev.turnId,
+        },
+      ],
+    };
+  }
+
   const idx = locate(chat.messages, ev.turnId);
   if (idx < 0) return chat;
 
   const current = chat.messages[idx];
-  const next = reduceAssistant({ ...current, turnId: ev.turnId }, ev);
+  const next = reduceAssistant(current, ev);
   const messages = chat.messages.slice();
   messages[idx] = next;
   return { messages };
 }
 
-function reduceAssistant(m: Message, ev: ChatEvent): Message {
+function reduceAssistant(m: Message, ev: Exclude<ChatEvent, { type: "turn.started" }>): Message {
   switch (ev.type) {
     case "token": {
       const parts = m.parts.slice();
@@ -154,4 +143,35 @@ function reduceAssistant(m: Message, ev: ChatEvent): Message {
     case "usage":
       return m; // not shown in the MVP UI
   }
+}
+
+export interface ReconciledSnapshot {
+  chat: ChatState;
+  approval: PendingApproval | null;
+}
+
+/** Replays a conversation snapshot and flushes live events buffered while OpenChat was in flight,
+ *  dropping buffered events already covered by the snapshot (seq <= snapshot.lastSeq). */
+export function replaySnapshot(
+  snapshot: Snapshot,
+  buffered: FaroEvent[],
+  currentApproval: PendingApproval | null = null,
+): ReconciledSnapshot {
+  let chat = emptyChat;
+  let approval = currentApproval;
+  for (const ev of snapshot.events) {
+    approval = applyApprovalEvent(approval, ev);
+    if (ev.type !== "index.progress" && ev.type !== "approval.request") {
+      chat = applyEvent(chat, ev);
+    }
+  }
+  for (const ev of buffered) {
+    if (ev.type === "index.progress") continue;
+    if (ev.seq !== undefined && ev.seq <= snapshot.lastSeq) continue;
+    approval = applyApprovalEvent(approval, ev);
+    if (ev.conversationId === snapshot.conversationId && ev.type !== "approval.request") {
+      chat = applyEvent(chat, ev);
+    }
+  }
+  return { chat, approval };
 }
