@@ -1,5 +1,5 @@
-// Mirrors internal/desktop/events.go (Event). Wails does not generate types for event payloads,
-// so this union is hand-written; keep it in sync with the Go struct.
+// Mirrors internal/desktop/events.go (Event, ChatInfo, ChatSummary, Snapshot). Wails does not
+// generate types for event payloads, so this union is hand-written; keep it in sync with Go.
 
 export interface Usage {
   prompt_tokens: number;
@@ -9,6 +9,8 @@ export interface Usage {
 }
 
 interface TurnScoped {
+  conversationId?: string;
+  seq?: number;
   turnId: string;
 }
 
@@ -33,6 +35,7 @@ interface ApprovalRequestFields {
 }
 
 export type FaroEvent =
+  | (TurnScoped & { type: "turn.started"; text: string })
   | (TurnScoped & { type: "token"; text: string })
   | (TurnScoped & {
       type: "tool_call";
@@ -60,6 +63,7 @@ export type FaroEvent =
     })
   | {
       type: "index.progress";
+      seq?: number;
       workspaceId: number;
       indexed?: number;
       skipped?: number;
@@ -72,3 +76,24 @@ export type ChatEvent = Exclude<FaroEvent, { type: "index.progress" | "approval.
 export type IndexEvent = Extract<FaroEvent, { type: "index.progress" }>;
 export type ApprovalRequestEvent = Extract<FaroEvent, { type: "approval.request" }>;
 export type ApprovalDecision = "allow" | "allow_session" | "deny";
+
+export interface ChatInfo {
+  conversationId: string;
+  botSlug: string;
+}
+
+export interface ChatSummary {
+  id: string;
+  botSlug: string;
+  botName: string;
+  updatedAt: number;
+  preview: string;
+}
+
+export interface Snapshot {
+  conversationId: string;
+  botSlug: string;
+  busy: boolean;
+  lastSeq: number;
+  events: FaroEvent[];
+}

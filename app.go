@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -16,9 +17,11 @@ const eventChannel = "faro:event"
 // App is the thin Wails shell. All behaviour lives in internal/desktop; this type only adds
 // the Wails-specific pieces (native dialogs, event emission) and exposes bound methods.
 type App struct {
-	ctx context.Context
-	st  *store.Store
-	ctl *desktop.Controller
+	ctx     context.Context
+	st      *store.Store
+	ctl     *desktop.Controller
+	dataDir string
+	srv     *desktop.Server
 }
 
 // NewApp opens the local store and builds the controller.
@@ -35,7 +38,7 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{st: st}
+	a := &App{st: st, dataDir: dataDir}
 	a.ctl, err = desktop.New(desktop.Options{
 		Store:   st,
 		Bots:    mgr,
@@ -52,9 +55,19 @@ func NewApp() (*App, error) {
 	return a, nil
 }
 
-func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+	if srv, err := desktop.StartServer(desktop.DefaultSocketPath(a.dataDir), a.ctl); err != nil {
+		log.Printf("faro socket server disabled: %v", err)
+	} else {
+		a.srv = srv
+	}
+}
 
 func (a *App) shutdown(_ context.Context) {
+	if a.srv != nil {
+		_ = a.srv.Close()
+	}
 	a.ctl.Shutdown()
 	_ = a.st.Close()
 }
@@ -95,8 +108,20 @@ func (a *App) NewChat(botSlug string) (desktop.ChatInfo, error) {
 	return a.ctl.NewChat(a.ctx, botSlug)
 }
 
-// Send starts a chat turn and returns its turn id; progress arrives on the event channel.
-func (a *App) Send(text string) (string, error) { return a.ctl.Send(a.ctx, text) }
+// OpenChat loads an existing conversation on demand and returns its replayable event snapshot.
+func (a *App) OpenChat(convID string) (desktop.Snapshot, error) {
+	return a.ctl.OpenChat(a.ctx, convID)
+}
+
+// ListChats returns recent single-bot conversations ordered newest first.
+func (a *App) ListChats() ([]desktop.ChatSummary, error) {
+	return a.ctl.ListChats(a.ctx)
+}
+
+// Send starts a chat turn in convID and returns its turn id; progress arrives on the event channel.
+func (a *App) Send(convID, text string) (string, error) {
+	return a.ctl.Send(a.ctx, convID, text)
+}
 
 // Cancel stops the running turn.
 func (a *App) Cancel() { a.ctl.Cancel() }

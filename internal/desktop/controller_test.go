@@ -234,7 +234,7 @@ func TestEveryChatHasABot(t *testing.T) {
 	if err != nil || chat.BotSlug != DefaultBotSlug {
 		t.Fatalf("chat=%+v err=%v", chat, err)
 	}
-	p := h.c.sess.SystemPrompt()
+	p := h.c.chats[chat.ConversationID].sess.SystemPrompt()
 	if !strings.Contains(p, "bot_run_command") || !strings.Contains(p, "deliver_file") || !strings.Contains(p, `slug="faro"`) {
 		t.Fatalf("system prompt should carry the default bot's identity and workshop tools:\n%s", p)
 	}
@@ -248,10 +248,11 @@ func TestSendStreamsTokensAndToolEventsThenDone(t *testing.T) {
 	h := newHarness(t, fc)
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
-	if _, err := h.c.NewChat(context.Background(), DefaultBotSlug); err != nil {
+	chat, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := h.c.Send(context.Background(), "what's in my folder?")
+	id, err := h.c.Send(context.Background(), chat.ConversationID, "what's in my folder?")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,14 +264,20 @@ func TestSendStreamsTokensAndToolEventsThenDone(t *testing.T) {
 		if e.TurnID != "" && e.TurnID != id {
 			t.Fatalf("event with wrong turn id: %+v", e)
 		}
+		if e.ConversationID != chat.ConversationID {
+			t.Fatalf("event with wrong conversation id: %+v", e)
+		}
 		types = append(types, e.Type)
 		if e.Type == EventToken {
 			text.WriteString(e.Text)
 		}
 	}
 	got := strings.Join(types, ",")
-	if !strings.Contains(got, "tool_call,tool_result") || !strings.HasSuffix(got, "turn.done") {
+	if !strings.HasPrefix(got, "turn.started,") || !strings.Contains(got, "tool_call,tool_result") || !strings.HasSuffix(got, "turn.done") {
 		t.Fatalf("types=%s", got)
+	}
+	if evs[0].Text != "what's in my folder?" {
+		t.Fatalf("turn.started text=%q", evs[0].Text)
 	}
 	if text.String() != "You have one note." {
 		t.Fatalf("streamed text=%q", text.String())
@@ -298,15 +305,23 @@ func TestSendRejectsConcurrentTurnAndCancelStopsIt(t *testing.T) {
 	h := newHarness(t, fc)
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
-	if _, err := h.c.NewChat(context.Background(), DefaultBotSlug); err != nil {
+	chat1, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.c.Send(context.Background(), "hi"); err != nil {
+	chat2, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.c.Send(context.Background(), chat1.ConversationID, "hi"); err != nil {
 		t.Fatal(err)
 	}
 	<-fc.block // Chat is in flight
-	if _, err := h.c.Send(context.Background(), "again"); err == nil {
-		t.Fatal("second concurrent turn must be rejected")
+	if _, err := h.c.Send(context.Background(), chat1.ConversationID, "again"); err == nil {
+		t.Fatal("second concurrent turn on same conversation must be rejected")
+	}
+	if _, err := h.c.Send(context.Background(), chat2.ConversationID, "other"); err == nil {
+		t.Fatal("second concurrent turn on another conversation must be rejected")
 	}
 	if _, err := h.c.NewChat(context.Background(), DefaultBotSlug); err == nil {
 		t.Fatal("NewChat during a turn must be rejected")
@@ -327,17 +342,18 @@ func TestFolderAddedMidChatIsMountedOnNextTurn(t *testing.T) {
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
 	chat, _ := h.c.NewChat(context.Background(), DefaultBotSlug)
-	_, _ = h.c.Send(context.Background(), "q1")
+	_, _ = h.c.Send(context.Background(), chat.ConversationID, "q1")
 	h.waitFor(t, isTurnEnd)
 	h.addFolder(t)
-	if _, err := h.c.Send(context.Background(), "q2"); err != nil {
+	if _, err := h.c.Send(context.Background(), chat.ConversationID, "q2"); err != nil {
 		t.Fatal(err)
 	}
 	h.waitFor(t, isTurnEnd)
-	if h.c.sess.ConversationID() != chat.ConversationID {
+	entry := h.c.chats[chat.ConversationID]
+	if entry.sess.ConversationID() != chat.ConversationID {
 		t.Fatal("rebuilding the session must keep the same conversation")
 	}
-	if n := strings.Count(h.c.sess.SystemPrompt(), "- id="); n != 2 {
+	if n := strings.Count(entry.sess.SystemPrompt(), "- id="); n != 2 {
 		t.Fatalf("expected 2 mounted folders, got %d", n)
 	}
 }

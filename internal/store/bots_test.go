@@ -133,3 +133,71 @@ func TestStoreMigratesV4ToV5AndIsolatesBotWorkspacesFromDefaultSearch(t *testing
 		t.Fatalf("expected default search to return only user workspace hit, got %+v", hits)
 	}
 }
+
+func TestMaxMessageSeqAndListConversationsWithBot(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	b1, err := st.CreateBot(ctx, store.Bot{ID: "bot_1", Slug: "faro", Name: "Faro", HomePath: "/tmp/faro"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := st.CreateBot(ctx, store.Bot{ID: "bot_2", Slug: "ledger", Name: "Ledger", HomePath: "/tmp/ledger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bot-less conversation must be excluded by ListConversationsWithBot.
+	if _, err := st.CreateConversation(ctx, "conv_nobot", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Multi-bot conversation must be excluded.
+	if _, err := st.CreateConversation(ctx, "conv_multi", "", b1.ID, b2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.CreateConversation(ctx, "conv_a", "", b1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if seq, err := st.MaxMessageSeq(ctx, "conv_a"); err != nil || seq != 0 {
+		t.Fatalf("empty MaxMessageSeq = (%d, %v), want (0, nil)", seq, err)
+	}
+	if err := st.AppendMessages(ctx, "conv_a", []store.MessageRecord{
+		{Role: "user", Content: "first line\nsecond line"},
+		{Role: "assistant", BotID: b1.ID, Content: "reply"},
+		{Role: "user", Content: "later message"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seq, err := st.MaxMessageSeq(ctx, "conv_a"); err != nil || seq != 3 {
+		t.Fatalf("MaxMessageSeq = (%d, %v), want (3, nil)", seq, err)
+	}
+
+	if _, err := st.CreateConversation(ctx, "conv_b", "", b2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := st.ListConversationsWithBot(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 single-bot conversations, got %+v", list)
+	}
+	// Both have same updated_at second, so id DESC orders conv_b before conv_a.
+	if list[0].ID != "conv_b" || list[0].BotSlug != "ledger" || list[0].FirstUserMessage != "" {
+		t.Fatalf("list[0]=%+v", list[0])
+	}
+	if list[1].ID != "conv_a" || list[1].BotSlug != "faro" || list[1].BotName != "Faro" || list[1].FirstUserMessage != "first line\nsecond line" {
+		t.Fatalf("list[1]=%+v", list[1])
+	}
+
+	limited, err := st.ListConversationsWithBot(ctx, 1)
+	if err != nil || len(limited) != 1 || limited[0].ID != "conv_b" {
+		t.Fatalf("limited=%+v err=%v", limited, err)
+	}
+}

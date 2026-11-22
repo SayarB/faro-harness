@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { ApprovalDialog } from "./features/approval/ApprovalDialog";
 import { ApiKeyScreen } from "./features/onboarding/ApiKeyScreen";
 import { BotList } from "./features/bots/BotList";
+import { ChatList } from "./features/chat/ChatList";
 import { ChatView } from "./features/chat/ChatView";
 import { FolderList } from "./features/workspaces/FolderList";
 import { AppShell } from "./layout/AppShell";
@@ -28,6 +29,7 @@ export function App() {
               <div className="px-4 py-3 text-base font-semibold">Faro</div>
               <div className="flex-1 space-y-6 overflow-y-auto px-3 pb-4">
                 <BotList />
+                <ChatList />
                 <FolderList />
               </div>
             </>

@@ -32,6 +32,15 @@ type Conversation struct {
 	UpdatedAt int64
 }
 
+// ConversationSummary is a lightweight row for listing recent single-bot conversations.
+type ConversationSummary struct {
+	ID               string
+	BotSlug          string
+	BotName          string
+	UpdatedAt        int64
+	FirstUserMessage string
+}
+
 // MessageRecord represents a single persisted chat or tool message in a conversation.
 type MessageRecord struct {
 	ID             int64
@@ -298,6 +307,57 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Mess
 			return nil, err
 		}
 		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// MaxMessageSeq returns the highest persisted message seq for conversationID, or 0 if empty.
+func (s *Store) MaxMessageSeq(ctx context.Context, conversationID string) (int, error) {
+	var maxSeq int
+	err := s.reader.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation_id = ?
+	`, conversationID).Scan(&maxSeq)
+	return maxSeq, err
+}
+
+// ListConversationsWithBot returns recent single-bot conversations newest first, along with each
+// conversation's bot slug/name and first user message in a single query.
+func (s *Store) ListConversationsWithBot(ctx context.Context, limit int) ([]ConversationSummary, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT
+			c.id,
+			b.slug,
+			b.name,
+			c.updated_at,
+			COALESCE((
+				SELECT m.content
+				FROM messages m
+				WHERE m.conversation_id = c.id AND m.role = 'user'
+				ORDER BY m.seq ASC, m.id ASC
+				LIMIT 1
+			), '') AS first_user_message
+		FROM conversations c
+		JOIN conversation_participants p ON p.conversation_id = c.id
+		JOIN bots b ON b.id = p.bot_id
+		WHERE (SELECT COUNT(*) FROM conversation_participants p2 WHERE p2.conversation_id = c.id) = 1
+		ORDER BY c.updated_at DESC, c.id DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ConversationSummary
+	for rows.Next() {
+		var item ConversationSummary
+		if err := rows.Scan(&item.ID, &item.BotSlug, &item.BotName, &item.UpdatedAt, &item.FirstUserMessage); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
 	}
 	return out, rows.Err()
 }

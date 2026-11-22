@@ -9,12 +9,12 @@ import (
 	"github.com/SayarB/faro-harness/internal/tools"
 )
 
-// Decisions the UI may send to RespondApproval.
+// Decisions the UI or CLI may send to RespondApproval.
 const (
 	DecisionAllow        = "allow"
 	DecisionAllowSession = "allow_session"
 	DecisionDeny         = "deny"
-	// DecisionCancelled is only ever reported by approval.resolved, never accepted from the UI.
+	// DecisionCancelled is only ever reported by approval.resolved, never accepted from clients.
 	DecisionCancelled = "cancelled"
 )
 
@@ -28,25 +28,29 @@ func choiceName(c approval.Choice) string {
 	return DecisionDeny
 }
 
-// newGate builds the approval policy for a chat. There are no auto-approve flags in the GUI:
-// every gated action is put in front of the user. Session memory lives as long as the Gate, i.e.
-// until the next NewChat.
-func (c *Controller) newGate() *approval.Gate {
-	return approval.NewGate(approval.Config{Ask: c.askUser})
+// newGate builds the approval policy for a chat. There are no auto-approve flags in the desktop
+// host: every gated action is put in front of the user. Session memory lives as long as the Gate
+// (preserved across workspace-added stale rebuilds for that conversation).
+func (c *Controller) newGate(convIDFn func() string) *approval.Gate {
+	return approval.NewGate(approval.Config{
+		Ask: func(ctx context.Context, req tools.ApprovalRequest) (approval.Choice, error) {
+			return c.askUser(ctx, convIDFn(), req)
+		},
+	})
 }
 
-// askUser is the GUI implementation of approval.Ask. It emits approval.request and blocks until
-// RespondApproval answers or ctx ends (Cancel / Shutdown), which counts as a denial so a pending
-// request never leaves a goroutine blocked.
-func (c *Controller) askUser(ctx context.Context, req tools.ApprovalRequest) (approval.Choice, error) {
+// askUser is the desktop implementation of approval.Ask. It emits approval.request and blocks
+// until RespondApproval answers or ctx ends (Cancel / Shutdown), which counts as a denial so a
+// pending request never leaves a goroutine blocked.
+func (c *Controller) askUser(ctx context.Context, convID string, req tools.ApprovalRequest) (approval.Choice, error) {
 	id, err := bot.NewID("appr")
 	if err != nil {
 		return approval.ChoiceDeny, err
 	}
+	turn := c.hub.runningTurnID(convID)
 	answer := make(chan approval.Choice, 1)
 	c.mu.Lock()
 	c.pending[id] = answer
-	turn := c.turnID
 	c.mu.Unlock()
 
 	decision := DecisionCancelled
@@ -54,11 +58,20 @@ func (c *Controller) askUser(ctx context.Context, req tools.ApprovalRequest) (ap
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
-		c.emit(Event{Type: EventApprovalResolved, TurnID: turn, ApprovalID: id, Decision: decision})
+		c.hub.emit(Event{
+			Type:           EventApprovalResolved,
+			ConversationID: convID,
+			TurnID:         turn,
+			ApprovalID:     id,
+			Decision:       decision,
+		})
 	}()
 
-	c.emit(Event{
-		Type: EventApprovalRequest, TurnID: turn, ApprovalID: id,
+	c.hub.emit(Event{
+		Type:              EventApprovalRequest,
+		ConversationID:    convID,
+		TurnID:            turn,
+		ApprovalID:        id,
 		Kind:              string(req.Kind),
 		Command:           approval.EscapeControl(req.Command),
 		Cwd:               approval.EscapeControl(req.Cwd),
@@ -81,8 +94,8 @@ func (c *Controller) askUser(ctx context.Context, req tools.ApprovalRequest) (ap
 	}
 }
 
-// RespondApproval delivers the user's answer for a pending approval request. This is a UI-only
-// entry point: it is never exposed to the model as a tool. An unrecognised decision denies.
+// RespondApproval delivers the user's answer for a pending approval request. First answer wins;
+// subsequent calls for the same id fail with "no longer pending". An unrecognised decision denies.
 // Whether "allow_session" is honoured is up to the Gate (it is not for unsandboxed commands).
 func (c *Controller) RespondApproval(id, decision string) error {
 	choice, known := approval.ChoiceDeny, true

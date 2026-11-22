@@ -25,18 +25,19 @@ func deliver(id, name string) llm.ChatResponse {
 	return toolCall(id, "deliver_file", strings.Replace(deliverArgs, "%s", name, 1))
 }
 
-// startChat adds a folder, opens a chat and sends one message. It returns the folder root.
-func startChat(t *testing.T, h *harness, botSlug string) string {
+// startChat adds a folder, opens a chat and sends one message. It returns the folder root and conversation id.
+func startChat(t *testing.T, h *harness, botSlug string) (string, string) {
 	t.Helper()
 	_ = h.c.SaveAPIKey("k")
 	ws := h.addFolder(t)
-	if _, err := h.c.NewChat(context.Background(), botSlug); err != nil {
+	chat, err := h.c.NewChat(context.Background(), botSlug)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.c.Send(context.Background(), "create a document out of this"); err != nil {
+	if _, err := h.c.Send(context.Background(), chat.ConversationID, "create a document out of this"); err != nil {
 		t.Fatal(err)
 	}
-	return ws.Path
+	return ws.Path, chat.ConversationID
 }
 
 func (h *harness) nextApproval(t *testing.T) Event {
@@ -56,11 +57,11 @@ func toolResultFor(evs []Event, id string) string {
 
 func TestApprovalAllowCreatesTheFile(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "Questionnaire.md"), say("Saved.")}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, convID := startChat(t, h, DefaultBotSlug)
 
 	req := h.nextApproval(t)
 	if req.Kind != "file_create" || req.DestRelPath != "Questionnaire.md" || req.SizeBytes == 0 ||
-		!strings.Contains(req.Preview, "# Questionnaire") || req.WorkspacePath != root || req.ApprovalID == "" || req.WorkspaceName == "" || req.Sandboxed {
+		!strings.Contains(req.Preview, "# Questionnaire") || req.WorkspacePath != root || req.ApprovalID == "" || req.WorkspaceName == "" || req.Sandboxed || req.ConversationID != convID {
 		t.Fatalf("request=%+v", req)
 	}
 	if _, err := os.Stat(filepath.Join(root, "Questionnaire.md")); err == nil {
@@ -82,7 +83,7 @@ func TestApprovalAllowCreatesTheFile(t *testing.T) {
 			resolved = e
 		}
 	}
-	if resolved.ApprovalID != req.ApprovalID || resolved.Decision != DecisionAllow {
+	if resolved.ApprovalID != req.ApprovalID || resolved.Decision != DecisionAllow || resolved.ConversationID != convID {
 		t.Fatalf("resolved=%+v", resolved)
 	}
 	if err := h.c.RespondApproval(req.ApprovalID, DecisionAllow); err == nil {
@@ -92,7 +93,7 @@ func TestApprovalAllowCreatesTheFile(t *testing.T) {
 
 func TestApprovalDenyWritesNothingAndSaysDenied(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "no.md"), say("Okay, not saved.")}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, _ := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	if err := h.c.RespondApproval(req.ApprovalID, DecisionDeny); err != nil {
 		t.Fatal(err)
@@ -108,7 +109,7 @@ func TestApprovalDenyWritesNothingAndSaysDenied(t *testing.T) {
 
 func TestApprovalSessionAllowCoversNextNewFileInThatChatOnly(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "a.md"), deliver("c2", "b.md"), say("done")}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, _ := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	if err := h.c.RespondApproval(req.ApprovalID, DecisionAllowSession); err != nil {
 		t.Fatal(err)
@@ -130,7 +131,7 @@ func TestApprovalOverwriteNeverSessionApproved(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{
 		toolCall("c1", "deliver_file", `{"dest_rel_path":"notes.md","content":"new","overwrite":true}`), say("done"),
 	}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, _ := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	if req.Kind != "file_overwrite" || req.ExistingSizeBytes == 0 {
 		t.Fatalf("request=%+v", req)
@@ -148,7 +149,7 @@ func TestApprovalOverwriteNeverSessionApproved(t *testing.T) {
 
 func TestCancelWhilePendingResolvesAsCancelledAndWritesNothing(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("unused")}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, _ := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	h.c.Cancel()
 	evs := h.waitFor(t, isTurnEnd)
@@ -177,7 +178,7 @@ func TestCancelWhilePendingResolvesAsCancelledAndWritesNothing(t *testing.T) {
 
 func TestShutdownWhilePendingDoesNotBlock(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("unused")}})
-	startChat(t, h, DefaultBotSlug)
+	_, _ = startChat(t, h, DefaultBotSlug)
 	h.nextApproval(t)
 	done := make(chan struct{})
 	go func() { h.c.Shutdown(); close(done) }()
@@ -190,7 +191,7 @@ func TestShutdownWhilePendingDoesNotBlock(t *testing.T) {
 
 func TestUnknownDecisionDeniesAndUnknownIDErrors(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("ok")}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, _ := startChat(t, h, DefaultBotSlug)
 	if err := h.c.RespondApproval("appr_nope", DecisionAllow); err == nil {
 		t.Fatal("unknown id must error")
 	}
@@ -216,10 +217,11 @@ func TestUnsandboxedCommandIsNeverSessionApproved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.c.NewChat(context.Background(), b.Slug); err != nil {
+	chat, err := h.c.NewChat(context.Background(), b.Slug)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.c.Send(context.Background(), "run things"); err != nil {
+	if _, err := h.c.Send(context.Background(), chat.ConversationID, "run things"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -252,8 +254,8 @@ func TestApprovalRequestEscapesControlCharacters(t *testing.T) {
 	}})
 	_ = h.c.SaveAPIKey("k")
 	b, _ := h.c.CreateBot(context.Background(), "Esc", "")
-	_, _ = h.c.NewChat(context.Background(), b.Slug)
-	_, _ = h.c.Send(context.Background(), "go")
+	chat, _ := h.c.NewChat(context.Background(), b.Slug)
+	_, _ = h.c.Send(context.Background(), chat.ConversationID, "go")
 	req := h.nextApproval(t)
 	if strings.ContainsAny(req.Command, "\x1b\r\n\u202e") || !strings.Contains(req.Command, `\u001b[2J\r\n`) || !strings.Contains(req.Command, `\u202e`) {
 		t.Fatalf("command not escaped: %q", req.Command)
@@ -271,7 +273,7 @@ func TestDefaultBotWordRequestRunsCommandThenDeliversScratchFile(t *testing.T) {
 		toolCall("c2", "deliver_file", `{"dest_rel_path":"report.docx","scratch_path":"scratch/out/report.docx"}`),
 		say("Saved report.docx."),
 	}})
-	root := startChat(t, h, DefaultBotSlug)
+	root, _ := startChat(t, h, DefaultBotSlug)
 
 	cmd := h.nextApproval(t)
 	if cmd.Kind != "command" || cmd.Sandboxed || cmd.BotName != "Faro" || !strings.Contains(cmd.Command, "report.docx") {

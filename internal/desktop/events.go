@@ -2,9 +2,10 @@ package desktop
 
 import "github.com/SayarB/faro-harness/internal/llm"
 
-// Event type names sent to the frontend on a single stream. Keep in sync with
-// frontend/src/lib/events.ts.
+// Event type names sent to the frontend and CLI socket subscribers on a single stream. Keep in
+// sync with frontend/src/lib/events.ts.
 const (
+	EventTurnStarted  = "turn.started"
 	EventToken        = "token"
 	EventToolCall     = "tool_call"
 	EventToolResult   = "tool_result"
@@ -18,13 +19,16 @@ const (
 	EventApprovalResolved = "approval.resolved"
 )
 
-// Event is the single JSON payload shape streamed to the UI; which fields are set depends on Type.
+// Event is the single JSON payload shape streamed to the UI and CLI attach clients; which fields
+// are set depends on Type. Keep in sync with frontend/src/lib/events.ts.
 type Event struct {
-	Type   string `json:"type"`
-	TurnID string `json:"turnId,omitempty"`
-	Step   int    `json:"step,omitempty"`
+	Type           string `json:"type"`
+	ConversationID string `json:"conversationId,omitempty"`
+	Seq            uint64 `json:"seq,omitempty"`
+	TurnID         string `json:"turnId,omitempty"`
+	Step           int    `json:"step,omitempty"`
 
-	Text string `json:"text,omitempty"` // token
+	Text string `json:"text,omitempty"` // token, turn.started
 
 	ToolCallID string `json:"toolCallId,omitempty"` // tool_call, tool_result
 	ToolName   string `json:"toolName,omitempty"`
@@ -86,8 +90,28 @@ type State struct {
 	Bots       []BotInfo       `json:"bots"`
 }
 
-// ChatInfo identifies the active chat session.
+// ChatInfo identifies a conversation and its bot.
 type ChatInfo struct {
 	ConversationID string `json:"conversationId"`
 	BotSlug        string `json:"botSlug"`
+}
+
+// ChatSummary describes a recent conversation for listing in the UI and CLI.
+type ChatSummary struct {
+	ID        string `json:"id"`
+	BotSlug   string `json:"botSlug"`
+	BotName   string `json:"botName"`
+	UpdatedAt int64  `json:"updatedAt"`
+	Preview   string `json:"preview"`
+}
+
+// Snapshot is the state of one conversation at a point in time, represented as replayable events.
+// Persisted history rows are converted to synthetic events with Seq 0; any in-flight turn's
+// coalesced log is appended afterwards. Clients ignore live events with Seq <= LastSeq.
+type Snapshot struct {
+	ConversationID string  `json:"conversationId"`
+	BotSlug        string  `json:"botSlug"`
+	Busy           bool    `json:"busy"`
+	LastSeq        uint64  `json:"lastSeq"`
+	Events         []Event `json:"events"`
 }

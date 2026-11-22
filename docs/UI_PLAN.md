@@ -28,8 +28,17 @@ Included:
 - Consequence: `bot_run_command` is reachable from every chat. It is still approval-gated each time and still unsandboxed, so the "full user permissions" banner appears far more often. Its single `memory.md` is shared by all chats with the default bot.
 - `faro-cli` still supports bot-less chats (the CLI is unchanged).
 
+**PR D (branch `feat/cli-attach-bot-thread`): CLI attach and shared desktop event stream. Implemented.**
+
+Included:
+- Desktop host & event hub (`internal/desktop/{hub.go,controller.go,events.go,server.go,client.go}`): `Controller` caches per-conversation sessions/gates (`OpenChat`, `ListChats`, `Send(convID, text)`, `Attach`) while still enforcing one running turn across the app. All events carry `conversationId` and a monotonic `seq`, and `turn.started` is emitted synchronously before `Send` returns so UI and CLI share one code path. Snapshots replay persisted SQLite history (`seq <= startMsgSeq` during a live turn) as synthetic events followed by the in-flight turn's coalesced log (including pending approvals) so attachers see no duplicates.
+- Local Unix domain socket at `<dataDir>/run/faro.sock` (directory mode `0700`, Wails `SingleInstanceLock` in `main.go`) serving newline-delimited JSON for one-shot RPCs (`list_chats`, `new_chat`, `send`, `cancel`, `respond_approval`) and long-lived `attach` streams.
+- CLI (`cmd/faro-cli/attach.go`): `faro-cli chats`, `faro-cli attach <conv-id>`, `faro-cli attach --bot <slug>`, and `faro-cli send <conv-id> <message...>` (with optional `--socket <path>`). Approvals show in both the desktop UI and attached CLI sessions; first answer wins and closes the other prompt. `faro-cli send` is non-interactive for approvals and waits for them to be answered in the app.
+- Frontend: removed optimistic messages (turns start exclusively from `turn.started`), added `openChat` with live-event buffering and `seq <= lastSeq` deduplication, a "Recent chats" list in the sidebar, and a copyable conversation ID in the chat header.
+- **Security & limitations (honest):** socket access control relies solely on filesystem permissions on `<dataDir>/run` (`0700`, same OS user). Any process running as that OS user can connect to the socket, read conversations, send messages, and approve actions. On Windows, POSIX file modes are not enforced. Standalone `faro-cli chat --conv <id>` runs outside the desktop host and is not locked against it, so it can still act as a second writer to a thread the host is running.
+
 Not included yet (each its own PR):
-- File citations / sources panel, conversation history, file watcher, keychain storage, OS sandbox.
+- File citations / sources panel, file watcher, keychain storage, OS sandbox.
 - Keychain storage matters more now: an approved unsandboxed `bot_run_command` can read the plaintext key file `settings.json` in the data dir.
 
 Decisions taken against the original recommendations:

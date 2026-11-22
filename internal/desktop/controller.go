@@ -26,6 +26,11 @@ import (
 // still receives the full result).
 const maxToolResultDisplay = 4 * 1024
 
+const (
+	maxListedChats = 50
+	maxChatPreview = 80
+)
+
 // Options configures a Controller.
 type Options struct {
 	Store   *store.Store
@@ -36,28 +41,34 @@ type Options struct {
 	NewClient func(apiKey string) (llm.Client, error)
 }
 
-// Controller owns all GUI state. Methods are safe for concurrent use.
+type chatEntry struct {
+	convID  string
+	sess    *agent.Session
+	gate    *approval.Gate
+	stale   bool
+	botSlug string
+}
+
+// Controller owns all desktop host state. Methods are safe for concurrent use.
 type Controller struct {
 	st      *store.Store
 	bots    *bot.Manager
 	dataDir string
-	emit    func(Event)
+	hub     *hub
 	newCli  func(string) (llm.Client, error)
 
 	rootCtx context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 
-	mu       sync.Mutex
-	sess     *agent.Session
-	botSlug  string
-	stale    bool // a folder was added since the session was built; rebuild before the next turn
-	busy     bool
-	turnID   string
-	turnStop context.CancelFunc
-	indexing map[int64]bool
-	gate     *approval.Gate
-	pending  map[string]chan approval.Choice // approval id -> answer channel
+	mu         sync.Mutex
+	chats      map[string]*chatEntry // conversationID -> cached session + approval gate
+	busy       bool
+	turnID     string
+	turnConvID string
+	turnStop   context.CancelFunc
+	indexing   map[int64]bool
+	pending    map[string]chan approval.Choice // approval id -> answer channel
 }
 
 // New creates a Controller.
@@ -65,18 +76,22 @@ func New(opts Options) (*Controller, error) {
 	if opts.Store == nil || opts.Bots == nil {
 		return nil, errors.New("store and bots manager are required")
 	}
-	if opts.Emit == nil {
-		opts.Emit = func(Event) {}
-	}
 	if opts.NewClient == nil {
 		opts.NewClient = func(key string) (llm.Client, error) { return llm.NewVercelGatewayClient(key, "") }
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Controller{
-		st: opts.Store, bots: opts.Bots, dataDir: opts.DataDir, emit: opts.Emit, newCli: opts.NewClient,
-		rootCtx: ctx, cancel: cancel, indexing: map[int64]bool{}, pending: map[string]chan approval.Choice{},
+		st:       opts.Store,
+		bots:     opts.Bots,
+		dataDir:  opts.DataDir,
+		hub:      newHub(opts.Emit),
+		newCli:   opts.NewClient,
+		rootCtx:  ctx,
+		cancel:   cancel,
+		chats:    map[string]*chatEntry{},
+		indexing: map[int64]bool{},
+		pending:  map[string]chan approval.Choice{},
 	}
-	c.gate = c.newGate()
 	if err := ensureDefaultBot(ctx, opts.Bots); err != nil {
 		cancel()
 		return nil, err
@@ -84,10 +99,11 @@ func New(opts Options) (*Controller, error) {
 	return c, nil
 }
 
-// Shutdown cancels running turns and indexing and waits for them to stop.
+// Shutdown cancels running turns and indexing, waits for them to stop, and closes subscribers.
 func (c *Controller) Shutdown() {
 	c.cancel()
 	c.wg.Wait()
+	c.hub.closeAll()
 }
 
 // apiKey returns the AI Gateway key. AI_GATEWAY_API_KEY in the environment wins over the saved key.
@@ -178,7 +194,9 @@ func (c *Controller) AddWorkspace(ctx context.Context, path string) (WorkspaceIn
 		return WorkspaceInfo{}, err
 	}
 	c.mu.Lock()
-	c.stale = true
+	for _, ch := range c.chats {
+		ch.stale = true
+	}
 	c.mu.Unlock()
 	c.startIndex(ws)
 	n, _ := c.st.WorkspaceFileCount(ctx, ws.ID)
@@ -218,7 +236,7 @@ func (c *Controller) startIndex(ws store.Workspace) {
 			c.mu.Unlock()
 		}()
 		progress := func(s worker.StatsSnapshot) {
-			c.emit(Event{Type: EventIndex, WorkspaceID: ws.ID, Indexed: s.Indexed, Skipped: s.Skipped, IndexErrors: s.Errors})
+			c.hub.emit(Event{Type: EventIndex, WorkspaceID: ws.ID, Indexed: s.Indexed, Skipped: s.Skipped, IndexErrors: s.Errors})
 		}
 		progress(worker.StatsSnapshot{})
 		_, snap, err := worker.IndexFolder(c.rootCtx, c.st, ws.RootPath, progress)
@@ -226,7 +244,7 @@ func (c *Controller) startIndex(ws store.Workspace) {
 		if err != nil && c.rootCtx.Err() == nil {
 			ev.Error = err.Error()
 		}
-		c.emit(ev)
+		c.hub.emit(ev)
 	}()
 }
 
@@ -287,55 +305,171 @@ func (c *Controller) NewChat(ctx context.Context, botSlug string) (ChatInfo, err
 	if c.busy {
 		return ChatInfo{}, errors.New("a reply is still in progress")
 	}
-	c.gate = c.newGate() // a new chat starts with no remembered approvals
-	sess, err := c.buildSession(ctx, botSlug, "")
+	entry := &chatEntry{}
+	entry.gate = c.newGate(func() string { return entry.convID })
+	sess, b, err := c.buildSession(ctx, botSlug, "", entry.gate, func(ev agent.Event) {
+		c.onAgentEvent(entry.convID, ev)
+	})
 	if err != nil {
 		return ChatInfo{}, err
 	}
-	c.sess, c.botSlug, c.stale = sess, botSlug, false
-	return ChatInfo{ConversationID: sess.ConversationID(), BotSlug: botSlug}, nil
+	entry.convID = sess.ConversationID()
+	entry.sess = sess
+	entry.botSlug = b.Slug
+	c.chats[entry.convID] = entry
+	return ChatInfo{ConversationID: entry.convID, BotSlug: entry.botSlug}, nil
+}
+
+// OpenChat loads an existing conversation on demand and returns its replayable event snapshot.
+func (c *Controller) OpenChat(ctx context.Context, convID string) (Snapshot, error) {
+	botSlug, err := c.ensureChat(ctx, convID)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return c.hub.snapshot(ctx, c.st, strings.TrimSpace(convID), botSlug)
+}
+
+// Attach loads an existing conversation on demand and atomically subscribes to its live events
+// while capturing a consistent initial snapshot (no live event can have Seq <= Snapshot.LastSeq).
+func (c *Controller) Attach(ctx context.Context, convID string) (Snapshot, <-chan Event, func(), error) {
+	convID = strings.TrimSpace(convID)
+	botSlug, err := c.ensureChat(ctx, convID)
+	if err != nil {
+		return Snapshot{}, nil, nil, err
+	}
+	snap, sub, err := c.hub.subscribeWithSnapshot(ctx, c.st, convID, botSlug)
+	if err != nil {
+		return Snapshot{}, nil, nil, err
+	}
+	return snap, sub.ch, func() { c.hub.unsubscribe(sub) }, nil
+}
+
+func (c *Controller) ensureChat(ctx context.Context, convID string) (string, error) {
+	convID = strings.TrimSpace(convID)
+	if convID == "" {
+		return "", errors.New("conversation id is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, err := c.loadChatLocked(ctx, convID)
+	if err != nil {
+		return "", err
+	}
+	return entry.botSlug, nil
+}
+
+// loadChatLocked returns the cached chatEntry for convID, loading and caching it from SQLite on
+// demand. Caller must hold c.mu.
+func (c *Controller) loadChatLocked(ctx context.Context, convID string) (*chatEntry, error) {
+	if entry, ok := c.chats[convID]; ok {
+		return entry, nil
+	}
+	conv, err := c.st.GetConversation(ctx, convID)
+	if err != nil {
+		return nil, err
+	}
+	if conv == nil {
+		return nil, fmt.Errorf("conversation %q not found", convID)
+	}
+	participants, err := c.st.ConversationParticipants(ctx, convID)
+	if err != nil {
+		return nil, err
+	}
+	if len(participants) == 0 {
+		return nil, fmt.Errorf("conversation %q has no bot participant and cannot be opened", convID)
+	}
+	if len(participants) > 1 {
+		return nil, fmt.Errorf("conversation %q has %d participants; only single-bot conversations are supported", convID, len(participants))
+	}
+	entry := &chatEntry{convID: convID}
+	entry.gate = c.newGate(func() string { return entry.convID })
+	sess, b, err := c.buildSession(ctx, participants[0], convID, entry.gate, func(ev agent.Event) {
+		c.onAgentEvent(entry.convID, ev)
+	})
+	if err != nil {
+		return nil, err
+	}
+	entry.sess = sess
+	entry.botSlug = b.Slug
+	c.chats[convID] = entry
+	return entry, nil
+}
+
+// ListChats returns up to 50 recent single-bot conversations ordered newest first.
+func (c *Controller) ListChats(ctx context.Context) ([]ChatSummary, error) {
+	rows, err := c.st.ListConversationsWithBot(ctx, maxListedChats)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChatSummary, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ChatSummary{
+			ID:        r.ID,
+			BotSlug:   r.BotSlug,
+			BotName:   r.BotName,
+			UpdatedAt: r.UpdatedAt,
+			Preview:   firstLinePreview(r.FirstUserMessage, maxChatPreview),
+		})
+	}
+	return out, nil
+}
+
+func firstLinePreview(s string, max int) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return truncate(line, max)
+		}
+	}
+	return ""
 }
 
 // buildSession must be called with c.mu held. Gated tools (deliver_file, bot_run_command) go
-// through the approval Gate, which asks the user via the approval dialog.
-func (c *Controller) buildSession(ctx context.Context, botSlug, convID string) (*agent.Session, error) {
+// through the chat's approval Gate, which asks the user via the approval event stream.
+func (c *Controller) buildSession(
+	ctx context.Context,
+	botSlugOrID, convID string,
+	gate *approval.Gate,
+	onEvent func(agent.Event),
+) (*agent.Session, *store.Bot, error) {
 	key := c.apiKey()
 	if key == "" {
-		return nil, errors.New("add your API key first")
+		return nil, nil, errors.New("add your API key first")
 	}
 	client, err := c.newCli(key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	wss, err := c.userWorkspaces(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if botSlug == "" {
-		return nil, errors.New("choose an assistant first")
+	if strings.TrimSpace(botSlugOrID) == "" {
+		return nil, nil, errors.New("choose an assistant first")
 	}
-	b, err := c.bots.Get(ctx, botSlug)
+	b, err := c.bots.Get(ctx, botSlugOrID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if b == nil {
-		return nil, fmt.Errorf("bot %q not found", botSlug)
+		return nil, nil, fmt.Errorf("bot %q not found", botSlugOrID)
 	}
-	reg, err := tools.NewRegistryWithOptions(c.st, wss, b, tools.RegistryOptions{Approver: c.gate.Approve})
+	reg, err := tools.NewRegistryWithOptions(c.st, wss, b, tools.RegistryOptions{Approver: gate.Approve})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return agent.NewSession(agent.Config{
+	sess, err := agent.NewSession(agent.Config{
 		Client: client, Tools: reg, Workspaces: wss, Bot: b, Store: c.st,
-		ConversationID: convID, StreamTokens: true, OnEvent: c.onAgentEvent,
+		ConversationID: convID, StreamTokens: true, OnEvent: onEvent,
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return sess, b, nil
 }
 
-func (c *Controller) onAgentEvent(ev agent.Event) {
-	c.mu.Lock()
-	turn := c.turnID
-	c.mu.Unlock()
-	out := Event{TurnID: turn, Step: ev.Step}
+func (c *Controller) onAgentEvent(convID string, ev agent.Event) {
+	out := Event{Step: ev.Step}
 	switch ev.Kind {
 	case agent.EventToken:
 		out.Type, out.Text = EventToken, ev.Text
@@ -350,7 +484,7 @@ func (c *Controller) onAgentEvent(ev agent.Event) {
 	default:
 		return
 	}
-	c.emit(out)
+	c.hub.emitForChat(convID, out)
 }
 
 func truncate(s string, max int) string {
@@ -364,35 +498,48 @@ func truncate(s string, max int) string {
 	return s[:cut] + "…"
 }
 
-// Send starts one chat turn and returns its id immediately; progress arrives as events and the
-// turn ends with exactly one of turn.done, turn.error or turn.cancelled. Only one turn runs at a time.
-func (c *Controller) Send(ctx context.Context, text string) (string, error) {
+// Send starts one chat turn in convID and returns its turn id immediately. turn.started is
+// emitted synchronously before Send returns; progress arrives as events and the turn ends with
+// exactly one of turn.done, turn.error or turn.cancelled. Only one turn runs across the app.
+func (c *Controller) Send(ctx context.Context, convID, text string) (string, error) {
+	convID = strings.TrimSpace(convID)
+	if convID == "" {
+		return "", errors.New("conversation id is required")
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return "", errors.New("message is empty")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.sess == nil {
-		return "", errors.New("no active chat; start one first")
-	}
 	if c.busy {
 		return "", errors.New("a reply is still in progress")
 	}
-	if c.stale {
-		rebuilt, err := c.buildSession(ctx, c.botSlug, c.sess.ConversationID())
+	entry, err := c.loadChatLocked(ctx, convID)
+	if err != nil {
+		return "", err
+	}
+	if entry.stale {
+		rebuilt, _, err := c.buildSession(ctx, entry.botSlug, entry.convID, entry.gate, func(ev agent.Event) {
+			c.onAgentEvent(entry.convID, ev)
+		})
 		if err != nil {
 			return "", err
 		}
-		c.sess, c.stale = rebuilt, false
+		entry.sess, entry.stale = rebuilt, false
+	}
+	startMsgSeq, err := c.st.MaxMessageSeq(ctx, entry.convID)
+	if err != nil {
+		return "", err
 	}
 	id, err := bot.NewID("turn")
 	if err != nil {
 		return "", err
 	}
 	turnCtx, stop := context.WithCancel(c.rootCtx)
-	c.busy, c.turnID, c.turnStop = true, id, stop
-	sess := c.sess
+	c.busy, c.turnID, c.turnConvID, c.turnStop = true, id, entry.convID, stop
+	c.hub.startTurn(entry.convID, id, startMsgSeq, text)
+	sess := entry.sess
 
 	c.wg.Add(1)
 	go func() {
@@ -402,19 +549,21 @@ func (c *Controller) Send(ctx context.Context, text string) (string, error) {
 		canceled := turnCtx.Err() != nil
 		stop()
 
-		c.mu.Lock()
-		c.busy, c.turnStop = false, nil
-		c.mu.Unlock()
-
+		var endEv Event
 		switch {
 		case err != nil && canceled:
-			c.emit(Event{Type: EventTurnCanceled, TurnID: id})
+			endEv = Event{Type: EventTurnCanceled, ConversationID: convID, TurnID: id}
 		case err != nil:
-			c.emit(Event{Type: EventTurnError, TurnID: id, Error: err.Error()})
+			endEv = Event{Type: EventTurnError, ConversationID: convID, TurnID: id, Error: err.Error()}
 		default:
 			u := res.Usage
-			c.emit(Event{Type: EventTurnDone, TurnID: id, Reply: res.Reply, Usage: &u, DurationMs: time.Since(start).Milliseconds()})
+			endEv = Event{Type: EventTurnDone, ConversationID: convID, TurnID: id, Reply: res.Reply, Usage: &u, DurationMs: time.Since(start).Milliseconds()}
 		}
+
+		c.mu.Lock()
+		c.busy, c.turnStop, c.turnID, c.turnConvID = false, nil, "", ""
+		c.hub.finishTurn(endEv)
+		c.mu.Unlock()
 	}()
 	return id, nil
 }

@@ -1,5 +1,6 @@
 // Pure approval state. At most one request is pending at a time (tool calls in a turn are
-// sequential), but it is keyed by id so a stale resolve never clears a newer request.
+// sequential), keyed by approvalId and turnId so an unrelated turn end or stale resolve never
+// clears a live request. Approvals apply regardless of which conversation is open in the UI.
 import type { ApprovalRequestEvent, FaroEvent } from "../lib/events";
 
 export type PendingApproval = ApprovalRequestEvent;
@@ -13,7 +14,7 @@ export function applyApprovalEvent(cur: PendingApproval | null, ev: FaroEvent): 
     case "turn.done":
     case "turn.error":
     case "turn.cancelled":
-      return null; // a finished turn can never have a live approval
+      return cur?.turnId === ev.turnId ? null : cur;
     default:
       return cur;
   }

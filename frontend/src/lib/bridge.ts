@@ -3,12 +3,12 @@
 import * as App from "../../wailsjs/go/main/App";
 import { EventsOn } from "../../wailsjs/runtime/runtime";
 import type { desktop } from "../../wailsjs/go/models";
-import type { ApprovalDecision, FaroEvent } from "./events";
+import type { ApprovalDecision, ChatInfo, ChatSummary, FaroEvent, Snapshot } from "./events";
 
 export type AppState = desktop.State;
 export type Workspace = desktop.WorkspaceInfo;
 export type Bot = desktop.BotInfo;
-export type ChatInfo = desktop.ChatInfo;
+export type { ChatInfo, ChatSummary, Snapshot };
 
 // Must match eventChannel in app.go.
 const EVENT_CHANNEL = "faro:event";
@@ -21,9 +21,14 @@ export const bridge = {
   rescan: (workspaceId: number): Promise<void> => App.Rescan(workspaceId),
   createBot: (name: string, instructions: string): Promise<Bot> => App.CreateBot(name, instructions),
   /** Starts a fresh conversation with the given bot. Every chat has a bot. */
-  newChat: (botSlug: string): Promise<ChatInfo> => App.NewChat(botSlug),
-  /** Starts a turn and resolves with its id; progress arrives via onEvent. */
-  send: (text: string): Promise<string> => App.Send(text),
+  newChat: (botSlug: string): Promise<ChatInfo> => App.NewChat(botSlug) as Promise<ChatInfo>,
+  /** Loads an existing conversation and returns its replayable event snapshot. */
+  openChat: (conversationId: string): Promise<Snapshot> =>
+    App.OpenChat(conversationId) as Promise<Snapshot>,
+  /** Lists recent single-bot conversations ordered newest first. */
+  listChats: (): Promise<ChatSummary[]> => App.ListChats() as Promise<ChatSummary[]>,
+  /** Starts a turn in conversationId and resolves with its id; progress arrives via onEvent. */
+  send: (conversationId: string, text: string): Promise<string> => App.Send(conversationId, text),
   cancel: (): Promise<void> => App.Cancel(),
   /** Answers the pending approval dialog. Human-only: never routed through the model. */
   respondApproval: (id: string, decision: ApprovalDecision): Promise<void> => App.RespondApproval(id, decision),

@@ -49,6 +49,12 @@ func main() {
 		err = runBot(args)
 	case "chat":
 		err = runChat(args)
+	case "chats":
+		err = runChats(args)
+	case "attach":
+		err = runAttach(args)
+	case "send":
+		err = runSend(args)
 	default:
 		usage()
 		os.Exit(1)
@@ -67,7 +73,10 @@ func usage() {
   faro-cli list   [--db <path>] [--json] [folder]
   faro-cli search [--db <path>] [--folder <workspace>] [--subdir <rel>] [--ext <ext>] [--depth <depth>] [--phrase <exact>] [--match-all] [--limit N] [query]
   faro-cli bot    <create|list|show> [flags]
-  faro-cli chat   [--db <path>] [--bots-dir <dir>] [--bot <slug>] [--conv <id>] [--model <provider/model>] [--base-url <url>] [--index] [--allow-commands] [--allow-writes] [--allow-overwrites] [--verbose=true|false] [--debug-prompt] [-q <question>] [folder...]`)
+  faro-cli chat   [--db <path>] [--bots-dir <dir>] [--bot <slug>] [--conv <id>] [--model <provider/model>] [--base-url <url>] [--index] [--allow-commands] [--allow-writes] [--allow-overwrites] [--verbose=true|false] [--debug-prompt] [-q <question>] [folder...]
+  faro-cli chats  [--socket <path>]
+  faro-cli attach [--socket <path>] (<conv-id> | --bot <slug>)
+  faro-cli send   [--socket <path>] <conv-id> <message...>`)
 }
 
 func runIndex(args []string) error {
