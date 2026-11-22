@@ -12,7 +12,7 @@ export function BotList() {
   const [creating, setCreating] = useState(false);
 
   const item = (slug: string, label: string) => (
-    <li key={slug || "faro"}>
+    <li key={slug}>
       <button
         disabled={busy}
         onClick={() => selectBot(slug)}
@@ -35,7 +35,6 @@ export function BotList() {
         </Button>
       </div>
       <ul className="space-y-1">
-        {item("", "Faro")}
         {bots.map((b) => item(b.slug, b.name))}
       </ul>
       <NewBotDialog open={creating} onOpenChange={setCreating} />
