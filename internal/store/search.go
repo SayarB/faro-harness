@@ -11,8 +11,10 @@ import (
 
 // SearchOptions configures structured lexical + trigram + metadata search over the catalog.
 type SearchOptions struct {
-	WorkspaceID int64    // 0 searches all workspaces
-	Query       string   // Free-form query string (OR-ed by default unless MatchAll is true)
+	WorkspaceID   int64    // 0 searches all workspaces matching WorkspaceIDs / WorkspaceKind
+	WorkspaceIDs  []int64  // Optional explicit allowlist of workspace IDs (takes precedence over WorkspaceID == 0)
+	WorkspaceKind string   // Optional workspace kind filter ("user", "bot", "all"); defaults to "user" when no explicit workspace IDs are given
+	Query         string   // Free-form query string (OR-ed by default unless MatchAll is true)
 	Terms       []string // Additional query terms merged with Query
 	ExactPhrase string   // Optional exact phrase that must appear in the match
 	MatchAll    bool     // Require all terms (AND) instead of OR-by-default
@@ -146,6 +148,7 @@ func (s *Store) searchFilterOnly(ctx context.Context, opts SearchOptions) (Searc
 			f.size, f.mtime_ns, f.index_depth, f.index_status,
 			COALESCE(b.title, ''), COALESCE(b.headings, '')
 		FROM files f
+		JOIN workspaces w ON w.id = f.workspace_id
 		LEFT JOIN content_blobs b
 			ON b.blake3 = f.blake3
 			AND b.peeker_id = f.peeker_id
@@ -199,6 +202,7 @@ func (s *Store) queryFTS(ctx context.Context, opts SearchOptions, ftsQuery strin
 			bm25(files_fts, 10.0, 5.0, 3.0, 1.0) AS rank
 		FROM files_fts
 		JOIN files f ON f.id = files_fts.rowid
+		JOIN workspaces w ON w.id = f.workspace_id
 		LEFT JOIN content_blobs b
 			ON b.blake3 = f.blake3
 			AND b.peeker_id = f.peeker_id
@@ -246,6 +250,7 @@ func (s *Store) queryTrigram(ctx context.Context, opts SearchOptions, trigramQue
 			bm25(files_trigram, 10.0, 3.0) AS rank
 		FROM files_trigram
 		JOIN files f ON f.id = files_trigram.rowid
+		JOIN workspaces w ON w.id = f.workspace_id
 		LEFT JOIN content_blobs b
 			ON b.blake3 = f.blake3
 			AND b.peeker_id = f.peeker_id
@@ -289,6 +294,21 @@ func buildFilterClauses(opts SearchOptions) (string, []any) {
 	if opts.WorkspaceID > 0 {
 		clauses = append(clauses, "f.workspace_id = ?")
 		args = append(args, opts.WorkspaceID)
+	} else if len(opts.WorkspaceIDs) > 0 {
+		placeholders := make([]string, len(opts.WorkspaceIDs))
+		for i, id := range opts.WorkspaceIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		clauses = append(clauses, "f.workspace_id IN ("+strings.Join(placeholders, ",")+")")
+	}
+	kind := strings.TrimSpace(strings.ToLower(opts.WorkspaceKind))
+	if kind == "" && opts.WorkspaceID == 0 && len(opts.WorkspaceIDs) == 0 {
+		kind = WorkspaceKindUser
+	}
+	if kind != "" && kind != "all" {
+		clauses = append(clauses, "w.kind = ?")
+		args = append(args, kind)
 	}
 	if ext := strings.TrimSpace(strings.ToLower(opts.Ext)); ext != "" {
 		if !strings.HasPrefix(ext, ".") {

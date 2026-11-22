@@ -19,6 +19,11 @@
 *.db-shm
 /.faro/
 
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
 # OS / Editor
 .DS_Store
 Thumbs.db
