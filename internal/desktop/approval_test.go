@@ -60,7 +60,7 @@ func TestApprovalAllowCreatesTheFile(t *testing.T) {
 
 	req := h.nextApproval(t)
 	if req.Kind != "file_create" || req.DestRelPath != "Questionnaire.md" || req.SizeBytes == 0 ||
-		!strings.Contains(req.Preview, "# Questionnaire") || req.ApprovalID == "" || req.WorkspaceName == "" || req.Sandboxed {
+		!strings.Contains(req.Preview, "# Questionnaire") || req.WorkspacePath != root || req.ApprovalID == "" || req.WorkspaceName == "" || req.Sandboxed {
 		t.Fatalf("request=%+v", req)
 	}
 	if _, err := os.Stat(filepath.Join(root, "Questionnaire.md")); err == nil {

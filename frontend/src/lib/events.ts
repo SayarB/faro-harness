@@ -23,6 +23,7 @@ interface ApprovalRequestFields {
   command?: string;
   cwd?: string;
   workspaceName?: string;
+  workspacePath?: string;
   destRelPath?: string;
   sizeBytes?: number;
   existingSizeBytes?: number;

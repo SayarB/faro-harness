@@ -51,6 +51,7 @@ type Event struct {
 	Command           string `json:"command,omitempty"`
 	Cwd               string `json:"cwd,omitempty"`
 	WorkspaceName     string `json:"workspaceName,omitempty"`
+	WorkspacePath     string `json:"workspacePath,omitempty"` // absolute folder the file goes into
 	DestRelPath       string `json:"destRelPath,omitempty"`
 	SizeBytes         int64  `json:"sizeBytes,omitempty"`
 	ExistingSizeBytes int64  `json:"existingSizeBytes,omitempty"`

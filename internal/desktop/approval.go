@@ -63,6 +63,7 @@ func (c *Controller) askUser(ctx context.Context, req tools.ApprovalRequest) (ap
 		Command:           approval.EscapeControl(req.Command),
 		Cwd:               approval.EscapeControl(req.Cwd),
 		WorkspaceName:     approval.EscapeControl(req.WorkspaceName),
+		WorkspacePath:     approval.EscapeControl(req.WorkspaceRoot),
 		DestRelPath:       approval.EscapeControl(req.DestRelPath),
 		SizeBytes:         req.SizeBytes,
 		ExistingSizeBytes: req.ExistingSizeBytes,

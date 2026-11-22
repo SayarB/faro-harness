@@ -3,6 +3,15 @@ import { useStore } from "../../state/store";
 import { Button } from "../../ui/Button";
 import { Dialog } from "../../ui/Dialog";
 
+/** Full path of the file when Go gave us the folder; otherwise the folder name and relative path. */
+function destinationPath(req: PendingApproval): string {
+  const rel = req.destRelPath ?? "";
+  const root = req.workspacePath;
+  if (!root) return req.workspaceName ? `${req.workspaceName} / ${rel}` : rel;
+  const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  return root.endsWith(sep) ? root + rel : root + sep + rel;
+}
+
 function formatBytes(n = 0): string {
   if (n < 1024) return `${n} bytes`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -100,8 +109,7 @@ function FileBody({ req }: { req: PendingApproval }) {
       <div>
         <div className="text-xs font-medium text-muted">{overwrite ? "Replaces" : "Saves to"}</div>
         <div className="mt-1 rounded bg-surface-2 p-2 text-xs break-all">
-          {req.workspaceName ? `${req.workspaceName} / ` : ""}
-          {req.destRelPath}
+          {destinationPath(req)}
         </div>
       </div>
       <div className="text-xs text-muted">
