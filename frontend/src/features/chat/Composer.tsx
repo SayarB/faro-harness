@@ -3,15 +3,14 @@ import { useBusy, useStore } from "../../state/store";
 import { Button } from "../../ui/Button";
 import { Textarea } from "../../ui/Field";
 
-export function Composer({ disabledReason }: { disabledReason?: string }) {
+export function Composer() {
   const send = useStore((s) => s.send);
   const cancel = useStore((s) => s.cancel);
   const busy = useBusy();
   const [text, setText] = useState("");
-  const disabled = !!disabledReason;
 
   function submit() {
-    if (disabled || busy || !text.trim()) return;
+    if (busy || !text.trim()) return;
     void send(text);
     setText("");
   }
@@ -22,8 +21,7 @@ export function Composer({ disabledReason }: { disabledReason?: string }) {
         <Textarea
           rows={2}
           value={text}
-          disabled={disabled}
-          placeholder={disabledReason ?? "Ask about your files…"}
+          placeholder="Ask about your files, or ask for a document…"
           aria-label="Message"
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -39,7 +37,7 @@ export function Composer({ disabledReason }: { disabledReason?: string }) {
             Stop
           </Button>
         ) : (
-          <Button variant="primary" onClick={submit} disabled={disabled || !text.trim()}>
+          <Button variant="primary" onClick={submit} disabled={!text.trim()}>
             Send
           </Button>
         )}

@@ -20,7 +20,7 @@ export const bridge = {
   pickFolder: async (): Promise<Workspace | null> => (await App.PickFolder()) ?? null,
   rescan: (workspaceId: number): Promise<void> => App.Rescan(workspaceId),
   createBot: (name: string, instructions: string): Promise<Bot> => App.CreateBot(name, instructions),
-  /** Starts a fresh conversation. An empty slug means plain Faro (no bot). */
+  /** Starts a fresh conversation with the given bot. Every chat has a bot. */
   newChat: (botSlug: string): Promise<ChatInfo> => App.NewChat(botSlug),
   /** Starts a turn and resolves with its id; progress arrives via onEvent. */
   send: (text: string): Promise<string> => App.Send(text),

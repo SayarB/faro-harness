@@ -19,7 +19,7 @@ interface Store {
   view: View;
   workspaces: Workspace[];
   bots: Bot[];
-  /** Selected bot slug; empty string means plain Faro. */
+  /** Selected bot slug. Empty only until the first state load picks the default bot. */
   botSlug: string;
   index: Record<number, IndexProgress>;
   chat: ChatState;
@@ -49,7 +49,12 @@ export const useStore = create<Store>((set, get) => {
 
   async function refresh() {
     const s = await bridge.getState();
-    set({ workspaces: s.workspaces, bots: s.bots, view: s.hasKey ? "chat" : "onboarding" });
+    set((st) => ({
+      workspaces: s.workspaces,
+      bots: s.bots,
+      botSlug: st.botSlug || s.defaultBot,
+      view: s.hasKey ? "chat" : "onboarding",
+    }));
   }
 
   function onEvent(ev: FaroEvent) {

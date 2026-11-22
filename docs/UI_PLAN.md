@@ -20,6 +20,14 @@ Included:
 - Honest wording is driven by `sandboxed` from the Go request: an unsandboxed command shows a banner ("Runs with your full user permissions and network access. Faro does not restrict it.") and has no session option; the "sandboxed" badge shows only when true (never today, there is no OS sandbox). The overwrite dialog says the original is backed up first, which `internal/tools/deliver.go` enforces (a failed or oversized backup aborts the write).
 - One line in `BaseSystemPrompt` telling the model that Faro asks for approval itself, so it should call `deliver_file` directly rather than ask in chat.
 
+**PR C (branch `feat/default-bot`, stacked on PR B): a default "Faro" bot for every chat. Implemented.**
+
+Included:
+- `internal/desktop/defaultbot.go`: an ordinary bot with the reserved slug `faro` is created idempotently when the controller starts (own `bot.md`, `memory.md`, `scratch/`). Its `bot.md` is plain prompt text and user-editable: do the task, build Word/Excel/PDF files in `scratch/` with `bot_run_command` then `deliver_file` with `scratch_path`, never silently substitute another format, say plainly what cannot be done, and do not ask for approval in chat. A bot already using the slug `faro` is adopted as-is, never overwritten.
+- Every chat has a bot: the no-bot ("plain Faro") path is removed from `NewChat`/`buildSession` and the UI. `State.defaultBot` names the default, it is listed first and selected on load, and a chat no longer needs a folder. `CreateBot` rejects names that slugify to `faro`.
+- Consequence: `bot_run_command` is reachable from every chat. It is still approval-gated each time and still unsandboxed, so the "full user permissions" banner appears far more often. Its single `memory.md` is shared by all chats with the default bot.
+- `faro-cli` still supports bot-less chats (the CLI is unchanged).
+
 Not included yet (each its own PR):
 - File citations / sources panel, conversation history, file watcher, keychain storage, OS sandbox.
 - Keychain storage matters more now: an approved unsandboxed `bot_run_command` can read the plaintext key file `settings.json` in the data dir.

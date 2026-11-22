@@ -90,7 +90,7 @@ func (a *App) CreateBot(name, instructions string) (desktop.BotInfo, error) {
 	return a.ctl.CreateBot(a.ctx, name, instructions)
 }
 
-// NewChat starts a fresh conversation (empty botSlug = plain Faro).
+// NewChat starts a fresh conversation with the given bot (the UI passes the default "faro" bot unless the user picked another).
 func (a *App) NewChat(botSlug string) (desktop.ChatInfo, error) {
 	return a.ctl.NewChat(a.ctx, botSlug)
 }
