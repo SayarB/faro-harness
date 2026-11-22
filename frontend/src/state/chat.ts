@@ -2,7 +2,7 @@
 // Wails) so it is trivially testable and the one place to extend when new event types arrive.
 import type { ChatEvent } from "../lib/events";
 
-export type ToolStatus = "running" | "done" | "error";
+export type ToolStatus = "running" | "done" | "error" | "declined";
 
 export type Part =
   | { kind: "text"; text: string }
@@ -14,6 +14,8 @@ export type Part =
       status: ToolStatus;
       result?: string;
       durationMs?: number;
+      /** The user said no in the approval dialog; shown as "You declined", not as a failure. */
+      declined?: boolean;
     };
 
 export type MessageStatus = "streaming" | "done" | "error" | "cancelled";
@@ -120,13 +122,26 @@ function reduceAssistant(m: Message, ev: ChatEvent): Message {
           p.kind === "tool" && p.callId === ev.toolCallId
             ? {
                 ...p,
-                status: toolResultFailed(ev.toolResult) ? ("error" as const) : ("done" as const),
+                status: p.declined
+                  ? ("declined" as const)
+                  : toolResultFailed(ev.toolResult)
+                    ? ("error" as const)
+                    : ("done" as const),
                 result: ev.toolResult,
                 durationMs: ev.durationMs,
               }
             : p,
         ),
       };
+    case "approval.resolved": {
+      if (ev.decision !== "deny") return m;
+      // Tool calls run one at a time, so the call waiting on this approval is the last running one.
+      const i = m.parts.map((p) => p.kind === "tool" && p.status === "running").lastIndexOf(true);
+      if (i < 0) return m;
+      const parts = m.parts.slice();
+      parts[i] = { ...(parts[i] as Extract<Part, { kind: "tool" }>), declined: true };
+      return { ...m, parts };
+    }
     case "turn.done": {
       const hasText = m.parts.some((p) => p.kind === "text" && p.text.length > 0);
       const parts = hasText || !ev.reply ? m.parts : [...m.parts, { kind: "text" as const, text: ev.reply }];

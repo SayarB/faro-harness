@@ -1,7 +1,8 @@
 // App state (Zustand). Chat/event logic lives in ./chat.ts; this file wires it to the bridge.
 import { create } from "zustand";
 import { bridge, errorMessage, type Bot, type Workspace } from "../lib/bridge";
-import type { FaroEvent } from "../lib/events";
+import type { ApprovalDecision, FaroEvent } from "../lib/events";
+import { applyApprovalEvent, type PendingApproval } from "./approval";
 import { applyEvent, beginTurn, emptyChat, failPending, isBusy, type ChatState } from "./chat";
 
 export type View = "loading" | "onboarding" | "chat";
@@ -22,6 +23,8 @@ interface Store {
   botSlug: string;
   index: Record<number, IndexProgress>;
   chat: ChatState;
+  /** The approval dialog's request, if one is waiting for the user. */
+  approval: PendingApproval | null;
   /** True once Go has a session for the current conversation. */
   chatReady: boolean;
   notice: string | null;
@@ -35,6 +38,7 @@ interface Store {
   newChat: () => void;
   send: (text: string) => Promise<void>;
   cancel: () => Promise<void>;
+  respondApproval: (decision: ApprovalDecision) => Promise<void>;
   dismissNotice: () => void;
 }
 
@@ -65,7 +69,10 @@ export const useStore = create<Store>((set, get) => {
       if (ev.done) void refresh().catch(fail);
       return;
     }
-    set((st) => ({ chat: applyEvent(st.chat, ev) }));
+    set((st) => ({
+      approval: applyApprovalEvent(st.approval, ev),
+      chat: ev.type === "approval.request" ? st.chat : applyEvent(st.chat, ev),
+    }));
   }
 
   return {
@@ -75,6 +82,7 @@ export const useStore = create<Store>((set, get) => {
     botSlug: "",
     index: {},
     chat: emptyChat,
+    approval: null,
     chatReady: false,
     notice: null,
 
@@ -163,6 +171,17 @@ export const useStore = create<Store>((set, get) => {
     async cancel() {
       try {
         await bridge.cancel();
+      } catch (err) {
+        fail(err);
+      }
+    },
+
+    async respondApproval(decision) {
+      const pending = get().approval;
+      if (!pending) return;
+      set({ approval: null }); // close at once so a double click cannot answer twice
+      try {
+        await bridge.respondApproval(pending.approvalId, decision);
       } catch (err) {
         fail(err);
       }

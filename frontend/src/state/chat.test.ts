@@ -85,3 +85,30 @@ describe("chat reducer", () => {
     expect(chat.messages[0].status).toBe("done");
   });
 });
+
+describe("approval declines", () => {
+  const call: ChatEvent = { type: "tool_call", turnId: "t1", toolCallId: "c1", toolName: "deliver_file", toolArgs: "{}" };
+  const denied: ChatEvent = { type: "approval.resolved", turnId: "t1", approvalId: "a1", decision: "deny" };
+  const refused: ChatEvent = {
+    type: "tool_result", turnId: "t1", toolCallId: "c1", toolName: "deliver_file",
+    toolResult: '{"error":"file delivery denied by user"}',
+  };
+
+  it("shows a user denial as declined, not as an error", () => {
+    const chat = run(start(), call, denied, refused);
+    expect(chat.messages[1].parts[0]).toMatchObject({ kind: "tool", status: "declined" });
+  });
+
+  it("keeps a real failure as an error when the user allowed it", () => {
+    const allowed: ChatEvent = { ...denied, decision: "allow" };
+    const chat = run(start(), call, allowed, refused);
+    expect(chat.messages[1].parts[0]).toMatchObject({ status: "error" });
+  });
+
+  it("does not mark a cancelled approval as declined", () => {
+    const cancelled: ChatEvent = { ...denied, decision: "cancelled" };
+    const chat = run(start(), call, cancelled, { type: "turn.cancelled", turnId: "t1" });
+    expect(chat.messages[1].parts[0]).toMatchObject({ status: "running" });
+    expect((chat.messages[1].parts[0] as { declined?: boolean }).declined).toBeUndefined();
+  });
+});

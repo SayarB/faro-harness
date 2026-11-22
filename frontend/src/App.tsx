@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { ApprovalDialog } from "./features/approval/ApprovalDialog";
 import { ApiKeyScreen } from "./features/onboarding/ApiKeyScreen";
 import { BotList } from "./features/bots/BotList";
 import { ChatView } from "./features/chat/ChatView";
@@ -35,6 +36,7 @@ export function App() {
           <ChatView />
         </AppShell>
       )}
+      <ApprovalDialog />
       {notice ? (
         <div
           role="alert"
