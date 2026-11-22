@@ -105,7 +105,7 @@ func botToolDefinitions() []llm.ToolDef {
 		{
 			Name: "bot_run_command",
 			Description: fmt.Sprintf(
-				"Run a terminal command using %s with working directory set to your own scratch/ folder (e.g. python3 or `uv run --with openpyxl/reportlab/pypdf/duckdb python ...`) to generate real Excel/PDF/Word files, analyze data, or inspect binary documents. Requires user approval unless pre-approved for the session. Environment variables FARO_BOT_DIR, FARO_SCRATCH_DIR, and FARO_WORKSPACES_READONLY (JSON map of workspace id to read-only path) are provided. Never modify files outside scratch/.",
+				"Run a terminal command using %s with working directory set to your own scratch/ folder (e.g. python3 or `uv run --with openpyxl/reportlab/pypdf/duckdb python ...`) to generate real Excel/PDF/Word files, analyze data, or inspect binary documents. Requires user approval unless pre-approved. Environment variables FARO_BOT_DIR, FARO_SCRATCH_DIR, and FARO_WORKSPACES_READONLY (JSON map of workspace id to workspace path; treat as read-only) are provided. Never modify files outside scratch/.",
 				shellName,
 			),
 			Parameters: json.RawMessage(`{
@@ -509,6 +509,7 @@ type commandAuditEntry struct {
 	ConversationID string   `json:"conversation_id,omitempty"`
 	Command        string   `json:"command"`
 	Decision       string   `json:"decision"`
+	Sandboxed      bool     `json:"sandboxed"`
 	ExitCode       int      `json:"exit_code"`
 	Signal         string   `json:"signal,omitempty"`
 	TimedOut       bool     `json:"timed_out,omitempty"`
@@ -530,6 +531,7 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 		return botRunCommandOut{}, errors.New("command is required")
 	}
 
+	sandboxed := r.SandboxEnforced()
 	decision, err := r.authorizeCommand(ctx, cmdStr)
 	if err != nil {
 		if errors.Is(err, ErrApprovalNonInteractive) {
@@ -540,6 +542,7 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 				ConversationID: r.currentConversationID(),
 				Command:        cmdStr,
 				Decision:       "non_interactive_denied",
+				Sandboxed:      sandboxed,
 				ExitCode:       -1,
 				Error:          err.Error(),
 			})
@@ -552,6 +555,7 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 			ConversationID: r.currentConversationID(),
 			Command:        cmdStr,
 			Decision:       "approver_error",
+			Sandboxed:      sandboxed,
 			ExitCode:       -1,
 			Error:          err.Error(),
 		})
@@ -565,6 +569,7 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 			ConversationID: r.currentConversationID(),
 			Command:        cmdStr,
 			Decision:       string(ApprovalDeny),
+			Sandboxed:      sandboxed,
 			ExitCode:       -1,
 		})
 		if r.approver == nil {
@@ -622,6 +627,7 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 			ConversationID: r.currentConversationID(),
 			Command:        cmdStr,
 			Decision:       string(decision),
+			Sandboxed:      sandboxed,
 			ExitCode:       -1,
 			Error:          "prepare sandbox: " + err.Error(),
 		})
@@ -666,6 +672,7 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 		ConversationID: r.currentConversationID(),
 		Command:        cmdStr,
 		Decision:       string(decision),
+		Sandboxed:      sandboxed,
 		DurationMS:     dur.Milliseconds(),
 		FilesChanged:   filesChanged,
 	}
@@ -712,8 +719,10 @@ func (r *Registry) execBotRunCommand(ctx context.Context, rawArgs string) (botRu
 }
 
 func (r *Registry) authorizeCommand(ctx context.Context, cmdStr string) (ApprovalDecision, error) {
+	sandboxed := r.SandboxEnforced()
+
 	r.mu.Lock()
-	if r.allowCmdSession {
+	if sandboxed && r.allowCmdSession {
 		r.mu.Unlock()
 		return ApprovalAllowSession, nil
 	}
@@ -725,18 +734,22 @@ func (r *Registry) authorizeCommand(ctx context.Context, cmdStr string) (Approva
 	}
 
 	dec, err := approver(ctx, ApprovalRequest{
-		Kind:    ApprovalKindCommand,
-		BotID:   r.bot.ID,
-		BotSlug: r.bot.Slug,
-		BotName: r.bot.Name,
-		Tool:    "bot_run_command",
-		Command: cmdStr,
-		Cwd:     bot.ScratchDirName + "/",
+		Kind:      ApprovalKindCommand,
+		BotID:     r.bot.ID,
+		BotSlug:   r.bot.Slug,
+		BotName:   r.bot.Name,
+		Tool:      "bot_run_command",
+		Command:   cmdStr,
+		Cwd:       bot.ScratchDirName + "/",
+		Sandboxed: sandboxed,
 	})
 	if err != nil {
 		return ApprovalDeny, err
 	}
 	if dec == ApprovalAllowSession {
+		if !sandboxed {
+			return ApprovalAllow, nil
+		}
 		r.mu.Lock()
 		r.allowCmdSession = true
 		r.mu.Unlock()

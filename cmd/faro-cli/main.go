@@ -443,7 +443,7 @@ func runChat(args []string) error {
 	model := fs.String("model", defaultModel, "model slug for Vercel AI Gateway (e.g. openai/gpt-6-luna, anthropic/claude-haiku-5.5)")
 	baseURL := fs.String("base-url", "", "optional OpenAI-compatible gateway base URL (defaults to Vercel AI Gateway)")
 	reindex := fs.Bool("index", false, "run an index pass on <folder> before chatting")
-	allowCommands := fs.Bool("allow-commands", false, "auto-approve bot_run_command without prompting")
+	allowCommands := fs.Bool("allow-commands", false, "auto-approve bot_run_command without prompting (runs with full user permissions when unsandboxed)")
 	allowWrites := fs.Bool("allow-writes", false, "auto-approve creating NEW workspace files via deliver_file without prompting (does not allow overwrites)")
 	allowOverwrites := fs.Bool("allow-overwrites", false, "auto-approve overwriting existing workspace files via deliver_file without prompting (originals are still backed up)")
 	verbose := fs.Bool("verbose", true, "print tool calls and token usage to stderr")
@@ -621,12 +621,17 @@ func runChat(args []string) error {
 		})
 	}
 
+	warnedUnsandboxedCommands := false
 	buildSession := func(resumeConvID string) (*agent.Session, error) {
 		reg, err := tools.NewRegistryWithOptions(st, workspaces, activeBot, tools.RegistryOptions{
 			Approver: toolApprover,
 		})
 		if err != nil {
 			return nil, err
+		}
+		if *allowCommands && !reg.SandboxEnforced() && !warnedUnsandboxedCommands {
+			warnedUnsandboxedCommands = true
+			fmt.Fprintln(os.Stderr, "[warning] --allow-commands is active without an OS sandbox: commands run with your full user permissions and network access")
 		}
 		return agent.NewSession(agent.Config{
 			Client:         client,

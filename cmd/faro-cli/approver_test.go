@@ -167,4 +167,110 @@ func TestCLIApproverInteractivePerWorkspaceScopeAndSanitization(t *testing.T) {
 	if !strings.Contains(out.String(), `\u001b[2Jfake\r\n`) {
 		t.Fatalf("expected escaped control chars in command prompt, got:\n%s", out.String())
 	}
+	if !strings.Contains(out.String(), "WARNING: runs unsandboxed") {
+		t.Fatalf("expected unsandboxed warning in command prompt, got:\n%s", out.String())
+	}
+}
+
+func TestCLIApproverCommandSandboxGating(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Unsandboxed command prompt warns, omits [a]llow for session, denies 'a', and prompts every time.
+	answers := []string{"a", "y", "y", "a", "n"}
+	idx := 0
+	var out bytes.Buffer
+	app := newCLIApprover(cliApproverConfig{
+		interactive: true,
+		promptOut:   &out,
+		readLine: func(_ context.Context) (string, error) {
+			a := answers[idx]
+			idx++
+			return a, nil
+		},
+	})
+
+	dec, err := app(ctx, tools.ApprovalRequest{
+		Kind:      tools.ApprovalKindCommand,
+		BotSlug:   "ledger",
+		Cwd:       "scratch/",
+		Command:   "echo one",
+		Sandboxed: false,
+	})
+	if err != nil || dec != tools.ApprovalDeny || idx != 1 {
+		t.Fatalf("unsandboxed 'a' must deny: dec=%v err=%v idx=%d", dec, err, idx)
+	}
+	if !strings.Contains(out.String(), "WARNING: runs unsandboxed") || strings.Contains(out.String(), "[a]llow for session") {
+		t.Fatalf("unexpected unsandboxed prompt:\n%s", out.String())
+	}
+
+	// Answering 'y' allows once and does not suppress the next unsandboxed prompt.
+	for wantIdx := 2; wantIdx <= 3; wantIdx++ {
+		dec, err = app(ctx, tools.ApprovalRequest{
+			Kind:      tools.ApprovalKindCommand,
+			BotSlug:   "ledger",
+			Cwd:       "scratch/",
+			Command:   "echo repeat",
+			Sandboxed: false,
+		})
+		if err != nil || dec != tools.ApprovalAllow || idx != wantIdx {
+			t.Fatalf("unsandboxed call %d: dec=%v err=%v idx=%d", wantIdx, dec, err, idx)
+		}
+	}
+
+	// 2. Sandboxed command prompt omits the unsandboxed warning, offers [a]llow for session, and caches it.
+	out.Reset()
+	dec, err = app(ctx, tools.ApprovalRequest{
+		Kind:      tools.ApprovalKindCommand,
+		BotSlug:   "ledger",
+		Cwd:       "scratch/",
+		Command:   "echo safe1",
+		Sandboxed: true,
+	})
+	if err != nil || dec != tools.ApprovalAllowSession || idx != 4 {
+		t.Fatalf("sandboxed 'a' must return AllowSession: dec=%v err=%v idx=%d", dec, err, idx)
+	}
+	if strings.Contains(out.String(), "WARNING: runs unsandboxed") || !strings.Contains(out.String(), "[a]llow for session") {
+		t.Fatalf("unexpected sandboxed prompt:\n%s", out.String())
+	}
+
+	// Second sandboxed command must not re-prompt.
+	dec, err = app(ctx, tools.ApprovalRequest{
+		Kind:      tools.ApprovalKindCommand,
+		BotSlug:   "ledger",
+		Cwd:       "scratch/",
+		Command:   "echo safe2",
+		Sandboxed: true,
+	})
+	if err != nil || dec != tools.ApprovalAllowSession || idx != 4 {
+		t.Fatalf("second sandboxed call should not re-prompt: dec=%v err=%v idx=%d", dec, err, idx)
+	}
+
+	// An unsandboxed command on the same approver must still prompt despite prior sandboxed session approval.
+	dec, err = app(ctx, tools.ApprovalRequest{
+		Kind:      tools.ApprovalKindCommand,
+		BotSlug:   "ledger",
+		Cwd:       "scratch/",
+		Command:   "echo unsafe_after_safe",
+		Sandboxed: false,
+	})
+	if err != nil || dec != tools.ApprovalDeny || idx != 5 {
+		t.Fatalf("unsandboxed call after sandboxed session grant must still prompt: dec=%v err=%v idx=%d", dec, err, idx)
+	}
+
+	// 3. --allow-commands still auto-approves every call even when unsandboxed & non-interactive.
+	appFlag := newCLIApprover(cliApproverConfig{
+		interactive:   false,
+		allowCommands: true,
+		promptOut:     &out,
+	})
+	for i := 0; i < 2; i++ {
+		dec, err = appFlag(ctx, tools.ApprovalRequest{
+			Kind:      tools.ApprovalKindCommand,
+			Command:   "echo auto",
+			Sandboxed: false,
+		})
+		if err != nil || dec != tools.ApprovalAllowSession {
+			t.Fatalf("--allow-commands call %d failed: dec=%v err=%v", i, dec, err)
+		}
+	}
 }

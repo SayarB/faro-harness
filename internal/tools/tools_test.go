@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -376,11 +377,14 @@ func TestBotToolsIsolationAndScratchpad(t *testing.T) {
 		t.Fatalf("expected approval denial without approver, got err=%v raw=%s", err, raw)
 	}
 
-	// Approval seam: Allow once, Deny, and AllowSession + allowlist env + files_changed + audit log.
+	// Approval seam: Allow once, Deny, and AllowSession (downgraded when unsandboxed) + allowlist env + files_changed + audit log.
 	var calls int
-	decisions := []ApprovalDecision{ApprovalDeny, ApprovalAllow, ApprovalAllowSession}
+	decisions := []ApprovalDecision{ApprovalDeny, ApprovalAllow, ApprovalAllowSession, ApprovalAllowSession}
 	regApproved, err := NewRegistryWithOptions(st, []store.Workspace{ws}, &ledger, RegistryOptions{
-		Approver: func(_ context.Context, _ ApprovalRequest) (ApprovalDecision, error) {
+		Approver: func(_ context.Context, req ApprovalRequest) (ApprovalDecision, error) {
+			if req.Sandboxed {
+				t.Errorf("expected default noopSandbox to report Sandboxed=false")
+			}
 			d := decisions[calls]
 			calls++
 			return d, nil
@@ -388,6 +392,9 @@ func TestBotToolsIsolationAndScratchpad(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("NewRegistryWithOptions: %v", err)
+	}
+	if regApproved.SandboxEnforced() {
+		t.Fatalf("expected default noopSandbox SandboxEnforced()=false")
 	}
 	regApproved.SetConversationID("conv_test_audit")
 
@@ -426,24 +433,85 @@ func TestBotToolsIsolationAndScratchpad(t *testing.T) {
 		t.Fatalf("counsel scratch should not have ledger's created.txt")
 	}
 
-	// 3rd call: AllowSession; 4th call must NOT invoke approver again.
+	// 3rd & 4th calls: while unsandboxed, AllowSession is downgraded to Allow and NOT cached;
+	// 4th call must invoke the approver again (keeping --allow-commands working per-call).
 	for i := 0; i < 2; i++ {
 		raw, err = regApproved.Execute(ctx, "bot_run_command", `{"command":"echo ok"}`)
 		if err != nil || !strings.Contains(raw, `"exit_code":0`) {
-			t.Fatalf("session-approved call %d failed: err=%v raw=%s", i, err, raw)
+			t.Fatalf("unsandboxed call %d failed: err=%v raw=%s", i, err, raw)
 		}
 	}
-	if calls != 3 {
-		t.Fatalf("expected approver to be called 3 times (4th covered by AllowSession), got %d", calls)
+	if calls != 4 {
+		t.Fatalf("expected approver to be called 4 times when unsandboxed (no session cache), got %d", calls)
 	}
 
-	// Audit log exists and contains conversation_id and entries.
+	// Audit log exists and contains conversation_id, files_changed, and sandboxed:false.
 	auditBytes, err := os.ReadFile(filepath.Join(ledger.HomePath, ".faro", "commands.log"))
 	if err != nil {
 		t.Fatalf("read commands.log: %v", err)
 	}
-	if !strings.Contains(string(auditBytes), `"conv_test_audit"`) || !strings.Contains(string(auditBytes), `"scratch/created.txt"`) {
+	if !strings.Contains(string(auditBytes), `"conv_test_audit"`) ||
+		!strings.Contains(string(auditBytes), `"scratch/created.txt"`) ||
+		!strings.Contains(string(auditBytes), `"sandboxed":false`) {
 		t.Fatalf("unexpected audit log contents:\n%s", string(auditBytes))
+	}
+	if strings.Contains(string(auditBytes), `"allow_session"`) {
+		t.Fatalf("unsandboxed audit log should record downgraded 'allow', not 'allow_session':\n%s", string(auditBytes))
+	}
+}
+
+type fakeEnforcedSandbox struct{}
+
+func (fakeEnforcedSandbox) Enforced() bool                       { return true }
+func (fakeEnforcedSandbox) Prepare(_ *exec.Cmd, _ Policy) error { return nil }
+
+func TestBotRunCommandSessionApprovalRequiresEnforcedSandbox(t *testing.T) {
+	st, ws, _ := setupIndexedWorkspace(t)
+	ctx := context.Background()
+
+	mgr, err := bot.NewManager(st, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	ledger, err := mgr.Create(ctx, bot.CreateOptions{Slug: "ledger", Name: "Ledger"})
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+
+	var calls int
+	reg, err := NewRegistryWithOptions(st, []store.Workspace{ws}, &ledger, RegistryOptions{
+		Sandbox: fakeEnforcedSandbox{},
+		Approver: func(_ context.Context, req ApprovalRequest) (ApprovalDecision, error) {
+			if !req.Sandboxed {
+				t.Errorf("expected enforced sandbox to report Sandboxed=true")
+			}
+			calls++
+			return ApprovalAllowSession, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistryWithOptions: %v", err)
+	}
+	if !reg.SandboxEnforced() {
+		t.Fatalf("expected SandboxEnforced()=true")
+	}
+
+	for i := 0; i < 2; i++ {
+		raw, err := reg.Execute(ctx, "bot_run_command", `{"command":"echo sandboxed"}`)
+		if err != nil || !strings.Contains(raw, `"exit_code":0`) {
+			t.Fatalf("sandboxed call %d failed: err=%v raw=%s", i, err, raw)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("expected approver to be called once with enforced sandbox AllowSession, got %d", calls)
+	}
+
+	auditBytes, err := os.ReadFile(filepath.Join(ledger.HomePath, ".faro", "commands.log"))
+	if err != nil {
+		t.Fatalf("read commands.log: %v", err)
+	}
+	if !strings.Contains(string(auditBytes), `"sandboxed":true`) || !strings.Contains(string(auditBytes), `"allow_session"`) {
+		t.Fatalf("expected sandboxed:true and allow_session in audit log:\n%s", string(auditBytes))
 	}
 }
 

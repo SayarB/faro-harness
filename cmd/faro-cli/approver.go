@@ -114,18 +114,25 @@ func newCLIApprover(cfg cliApproverConfig) tools.Approver {
 			if cfg.allowCommands {
 				return tools.ApprovalAllowSession, nil
 			}
-			mu.Lock()
-			approved := cmdSessionApproved
-			mu.Unlock()
-			if approved {
-				return tools.ApprovalAllowSession, nil
+			if req.Sandboxed {
+				mu.Lock()
+				approved := cmdSessionApproved
+				mu.Unlock()
+				if approved {
+					return tools.ApprovalAllowSession, nil
+				}
 			}
 			if !cfg.interactive || cfg.readLine == nil {
 				fmt.Fprintf(out, "[approval] denied command in non-interactive mode (pass --allow-commands to permit)\n")
 				return tools.ApprovalDeny, tools.ErrApprovalNonInteractive
 			}
-			fmt.Fprintf(out, "\n[approval] %q wants to run a command in %q:\n  $ %s\nAllow? [y]es / [N]o / [a]llow for session: ",
-				actor, req.Cwd, sanitizeTerminalCommand(req.Command))
+			if req.Sandboxed {
+				fmt.Fprintf(out, "\n[approval] %q wants to run a command in %q:\n  $ %s\nAllow? [y]es / [N]o / [a]llow for session: ",
+					actor, req.Cwd, sanitizeTerminalCommand(req.Command))
+			} else {
+				fmt.Fprintf(out, "\n[approval] %q wants to run a command in %q:\n  $ %s\n  WARNING: runs unsandboxed with your full user permissions and network access.\nAllow? [y]es / [N]o: ",
+					actor, req.Cwd, sanitizeTerminalCommand(req.Command))
+			}
 			ans, err := cfg.readLine(callCtx)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
@@ -140,10 +147,13 @@ func newCLIApprover(cfg cliApproverConfig) tools.Approver {
 			case "y", "yes":
 				return tools.ApprovalAllow, nil
 			case "a", "all", "session", "allow":
-				mu.Lock()
-				cmdSessionApproved = true
-				mu.Unlock()
-				return tools.ApprovalAllowSession, nil
+				if req.Sandboxed {
+					mu.Lock()
+					cmdSessionApproved = true
+					mu.Unlock()
+					return tools.ApprovalAllowSession, nil
+				}
+				return tools.ApprovalDeny, nil
 			default:
 				return tools.ApprovalDeny, nil
 			}

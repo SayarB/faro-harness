@@ -109,6 +109,11 @@ func (r *Registry) SetConversationID(id string) {
 	r.mu.Unlock()
 }
 
+// SandboxEnforced reports whether bot_run_command is backed by an active OS sandbox.
+func (r *Registry) SandboxEnforced() bool {
+	return r.sandbox != nil && r.sandbox.Enforced()
+}
+
 func (r *Registry) currentConversationID() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

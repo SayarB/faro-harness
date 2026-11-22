@@ -47,6 +47,7 @@ type ApprovalRequest struct {
 	ExistingSizeBytes int64
 	Preview           string
 	WillOverwrite     bool
+	Sandboxed         bool
 }
 
 // Approver evaluates whether a gated action (such as bot_run_command or deliver_file) is permitted.
@@ -62,11 +63,13 @@ type Policy struct {
 
 // Sandbox configures OS-level isolation on an exec.Cmd before Start/Run.
 type Sandbox interface {
+	Enforced() bool
 	Prepare(cmd *exec.Cmd, p Policy) error
 }
 
 type noopSandbox struct{}
 
+func (noopSandbox) Enforced() bool                       { return false }
 func (noopSandbox) Prepare(_ *exec.Cmd, _ Policy) error { return nil }
 
 // RuntimeInfo describes the resolved Python / uv runtime available to bot commands.
