@@ -77,6 +77,10 @@ func New(opts Options) (*Controller, error) {
 		rootCtx: ctx, cancel: cancel, indexing: map[int64]bool{}, pending: map[string]chan approval.Choice{},
 	}
 	c.gate = c.newGate()
+	if err := ensureDefaultBot(ctx, opts.Bots); err != nil {
+		cancel()
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -106,7 +110,7 @@ func (c *Controller) SaveAPIKey(key string) error {
 
 // State returns the current keys/folders/bots snapshot.
 func (c *Controller) State(ctx context.Context) (State, error) {
-	out := State{HasKey: c.apiKey() != "", Workspaces: []WorkspaceInfo{}, Bots: []BotInfo{}}
+	out := State{HasKey: c.apiKey() != "", DefaultBot: DefaultBotSlug, Workspaces: []WorkspaceInfo{}, Bots: []BotInfo{}}
 	wss, err := c.userWorkspaces(ctx)
 	if err != nil {
 		return out, err
@@ -123,7 +127,12 @@ func (c *Controller) State(ctx context.Context) (State, error) {
 		return out, err
 	}
 	for _, b := range bs {
-		out.Bots = append(out.Bots, BotInfo{ID: b.ID, Slug: b.Slug, Name: b.Name})
+		info := BotInfo{ID: b.ID, Slug: b.Slug, Name: b.Name}
+		if b.Slug == DefaultBotSlug {
+			out.Bots = append([]BotInfo{info}, out.Bots...) // the default bot is listed first
+		} else {
+			out.Bots = append(out.Bots, info)
+		}
 	}
 	return out, nil
 }
@@ -228,6 +237,9 @@ func (c *Controller) CreateBot(ctx context.Context, name, instructions string) (
 	if base == "" {
 		return BotInfo{}, errors.New("give the bot a name using letters or numbers")
 	}
+	if base == DefaultBotSlug {
+		return BotInfo{}, fmt.Errorf("%q is the name of the built-in assistant; choose a different name", DefaultBotName)
+	}
 	for i := 1; i <= 20; i++ {
 		slug := base
 		if i > 1 {
@@ -267,7 +279,8 @@ func slugify(name string) string {
 	return s
 }
 
-// NewChat starts a fresh conversation, optionally as a bot (empty botSlug = plain Faro).
+// NewChat starts a fresh conversation with the bot botSlug. Every chat has a bot; the UI
+// selects the default one ("faro") unless the user picks another.
 func (c *Controller) NewChat(ctx context.Context, botSlug string) (ChatInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -298,17 +311,15 @@ func (c *Controller) buildSession(ctx context.Context, botSlug, convID string) (
 	if err != nil {
 		return nil, err
 	}
-	var b *store.Bot
-	if botSlug != "" {
-		if b, err = c.bots.Get(ctx, botSlug); err != nil {
-			return nil, err
-		}
-		if b == nil {
-			return nil, fmt.Errorf("bot %q not found", botSlug)
-		}
+	if botSlug == "" {
+		return nil, errors.New("choose an assistant first")
 	}
-	if len(wss) == 0 && b == nil {
-		return nil, errors.New("add a folder first (or choose a bot)")
+	b, err := c.bots.Get(ctx, botSlug)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil {
+		return nil, fmt.Errorf("bot %q not found", botSlug)
 	}
 	reg, err := tools.NewRegistryWithOptions(c.st, wss, b, tools.RegistryOptions{Approver: c.gate.Approve})
 	if err != nil {

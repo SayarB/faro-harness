@@ -81,6 +81,7 @@ type BotInfo struct {
 // State is the app snapshot the UI loads at startup and after changes.
 type State struct {
 	HasKey     bool            `json:"hasKey"`
+	DefaultBot string          `json:"defaultBot"` // slug of the built-in bot; Bots lists it first
 	Workspaces []WorkspaceInfo `json:"workspaces"`
 	Bots       []BotInfo       `json:"bots"`
 }

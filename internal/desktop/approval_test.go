@@ -56,7 +56,7 @@ func toolResultFor(evs []Event, id string) string {
 
 func TestApprovalAllowCreatesTheFile(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "Questionnaire.md"), say("Saved.")}})
-	root := startChat(t, h, "")
+	root := startChat(t, h, DefaultBotSlug)
 
 	req := h.nextApproval(t)
 	if req.Kind != "file_create" || req.DestRelPath != "Questionnaire.md" || req.SizeBytes == 0 ||
@@ -92,7 +92,7 @@ func TestApprovalAllowCreatesTheFile(t *testing.T) {
 
 func TestApprovalDenyWritesNothingAndSaysDenied(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "no.md"), say("Okay, not saved.")}})
-	root := startChat(t, h, "")
+	root := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	if err := h.c.RespondApproval(req.ApprovalID, DecisionDeny); err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func TestApprovalDenyWritesNothingAndSaysDenied(t *testing.T) {
 
 func TestApprovalSessionAllowCoversNextNewFileInThatChatOnly(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "a.md"), deliver("c2", "b.md"), say("done")}})
-	root := startChat(t, h, "")
+	root := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	if err := h.c.RespondApproval(req.ApprovalID, DecisionAllowSession); err != nil {
 		t.Fatal(err)
@@ -130,7 +130,7 @@ func TestApprovalOverwriteNeverSessionApproved(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{
 		toolCall("c1", "deliver_file", `{"dest_rel_path":"notes.md","content":"new","overwrite":true}`), say("done"),
 	}})
-	root := startChat(t, h, "")
+	root := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	if req.Kind != "file_overwrite" || req.ExistingSizeBytes == 0 {
 		t.Fatalf("request=%+v", req)
@@ -148,7 +148,7 @@ func TestApprovalOverwriteNeverSessionApproved(t *testing.T) {
 
 func TestCancelWhilePendingResolvesAsCancelledAndWritesNothing(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("unused")}})
-	root := startChat(t, h, "")
+	root := startChat(t, h, DefaultBotSlug)
 	req := h.nextApproval(t)
 	h.c.Cancel()
 	evs := h.waitFor(t, isTurnEnd)
@@ -177,7 +177,7 @@ func TestCancelWhilePendingResolvesAsCancelledAndWritesNothing(t *testing.T) {
 
 func TestShutdownWhilePendingDoesNotBlock(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("unused")}})
-	startChat(t, h, "")
+	startChat(t, h, DefaultBotSlug)
 	h.nextApproval(t)
 	done := make(chan struct{})
 	go func() { h.c.Shutdown(); close(done) }()
@@ -190,7 +190,7 @@ func TestShutdownWhilePendingDoesNotBlock(t *testing.T) {
 
 func TestUnknownDecisionDeniesAndUnknownIDErrors(t *testing.T) {
 	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{deliver("c1", "x.md"), say("ok")}})
-	root := startChat(t, h, "")
+	root := startChat(t, h, DefaultBotSlug)
 	if err := h.c.RespondApproval("appr_nope", DecisionAllow); err == nil {
 		t.Fatal("unknown id must error")
 	}
@@ -260,4 +260,52 @@ func TestApprovalRequestEscapesControlCharacters(t *testing.T) {
 	}
 	_ = h.c.RespondApproval(req.ApprovalID, DecisionDeny)
 	h.waitFor(t, isTurnEnd)
+}
+
+// A plain chat (default bot) can produce a binary document: it builds the file in scratch/ with
+// bot_run_command, then promotes it with deliver_file scratch_path. Each step asks for approval.
+// The command is faked with printf; the real flow would run python-docx.
+func TestDefaultBotWordRequestRunsCommandThenDeliversScratchFile(t *testing.T) {
+	h := newHarness(t, &fakeClient{scripts: []llm.ChatResponse{
+		toolCall("c1", "bot_run_command", `{"command":"mkdir -p out && printf 'PK-fake-docx' > out/report.docx"}`),
+		toolCall("c2", "deliver_file", `{"dest_rel_path":"report.docx","scratch_path":"scratch/out/report.docx"}`),
+		say("Saved report.docx."),
+	}})
+	root := startChat(t, h, DefaultBotSlug)
+
+	cmd := h.nextApproval(t)
+	if cmd.Kind != "command" || cmd.Sandboxed || cmd.BotName != "Faro" || !strings.Contains(cmd.Command, "report.docx") {
+		t.Fatalf("command request=%+v", cmd)
+	}
+	if err := h.c.RespondApproval(cmd.ApprovalID, DecisionAllow); err != nil {
+		t.Fatal(err)
+	}
+	file := h.nextApproval(t)
+	if file.Kind != "file_create" || file.DestRelPath != "report.docx" || file.SizeBytes != int64(len("PK-fake-docx")) {
+		t.Fatalf("delivery request=%+v", file)
+	}
+	if _, err := os.Stat(filepath.Join(root, "report.docx")); err == nil {
+		t.Fatal("file must not exist before the delivery is approved")
+	}
+	if err := h.c.RespondApproval(file.ApprovalID, DecisionAllow); err != nil {
+		t.Fatal(err)
+	}
+	evs := h.waitFor(t, isTurnEnd)
+	if evs[len(evs)-1].Type != EventTurnDone {
+		t.Fatalf("last=%+v", evs[len(evs)-1])
+	}
+	got, err := os.ReadFile(filepath.Join(root, "report.docx"))
+	if err != nil || string(got) != "PK-fake-docx" {
+		t.Fatalf("delivered file: %q err=%v", got, err)
+	}
+	// The order matters: the command ran first, then the delivery.
+	var order []string
+	for _, e := range h.log {
+		if e.Type == EventToolCall {
+			order = append(order, e.ToolName)
+		}
+	}
+	if strings.Join(order, ",") != "bot_run_command,deliver_file" {
+		t.Fatalf("tool order=%v", order)
+	}
 }
