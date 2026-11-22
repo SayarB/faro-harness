@@ -453,3 +453,64 @@ func TestTwoBotsIsolatedMemoryScratchpadAndPersistedConversations(t *testing.T) 
 		t.Fatalf("counsel system prompt leaked ledger context:\n%s", sp)
 	}
 }
+
+type deltaLLMClient struct{ chunks []string }
+
+func (d *deltaLLMClient) Chat(_ context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
+	if req.OnDelta != nil {
+		for _, c := range d.chunks {
+			req.OnDelta(c)
+		}
+	}
+	return llm.ChatResponse{Message: llm.Message{Role: llm.RoleAssistant, Content: strings.Join(d.chunks, "")}}, nil
+}
+
+func TestSessionStreamTokensIsOptIn(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ws, err := st.EnsureWorkspace(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := tools.NewRegistry(st, []store.Workspace{ws})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(stream bool) []Event {
+		var evs []Event
+		sess, err := NewSession(Config{
+			Client:       &deltaLLMClient{chunks: []string{"Hel", "lo"}},
+			Tools:        reg,
+			Workspaces:   []store.Workspace{ws},
+			StreamTokens: stream,
+			OnEvent:      func(ev Event) { evs = append(evs, ev) },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := sess.Turn(context.Background(), "hi")
+		if err != nil || res.Reply != "Hello" {
+			t.Fatalf("reply=%q err=%v", res.Reply, err)
+		}
+		return evs
+	}
+
+	var tokens []string
+	for _, ev := range run(true) {
+		if ev.Kind == EventToken {
+			tokens = append(tokens, ev.Text)
+		}
+	}
+	if strings.Join(tokens, "|") != "Hel|lo" {
+		t.Fatalf("tokens=%v", tokens)
+	}
+	for _, ev := range run(false) {
+		if ev.Kind == EventToken {
+			t.Fatalf("token event emitted without StreamTokens")
+		}
+	}
+}

@@ -54,6 +54,10 @@ type ChatRequest struct {
 	SessionID string
 	Messages  []Message
 	Tools     []ToolDef
+	// OnDelta, when set, asks the client to stream the reply and calls OnDelta with each
+	// text fragment as it arrives. Chat still returns the complete assembled response.
+	// Clients that cannot stream may ignore it.
+	OnDelta func(text string)
 }
 
 // ChatResponse is a normalized model completion response.

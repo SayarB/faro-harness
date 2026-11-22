@@ -321,3 +321,95 @@ func TestOpenAICompatClientGatewayError(t *testing.T) {
 		t.Fatalf("expected gateway error message, got %v", err)
 	}
 }
+
+func TestOpenAICompatClientStreamsTextAndUsage(t *testing.T) {
+	var gotReq wireChatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, l := range []string{
+			`data: {"model":"m","choices":[{"delta":{"role":"assistant","content":"Hel"}}]}`,
+			``,
+			`data: {"choices":[{"delta":{"content":"lo"}}]}`,
+			``,
+			`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":4}}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		} {
+			_, _ = w.Write([]byte(l + "\n"))
+		}
+	}))
+	defer srv.Close()
+
+	client, err := NewVercelGatewayClient("k", srv.URL+"/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas []string
+	resp, err := client.Chat(context.Background(), ChatRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+		OnDelta:  func(s string) { deltas = append(deltas, s) },
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if !gotReq.Stream || gotReq.StreamOptions == nil || !gotReq.StreamOptions.IncludeUsage {
+		t.Fatalf("stream flags not sent: %+v", gotReq)
+	}
+	if resp.Message.Content != "Hello" || strings.Join(deltas, "|") != "Hel|lo" {
+		t.Fatalf("content=%q deltas=%v", resp.Message.Content, deltas)
+	}
+	if resp.FinishReason != "stop" || resp.Model != "m" {
+		t.Fatalf("finish=%q model=%q", resp.FinishReason, resp.Model)
+	}
+	if resp.Usage.PromptTokens != 10 || resp.Usage.CachedTokens != 4 || resp.Usage.TotalTokens != 12 {
+		t.Fatalf("usage=%+v", resp.Usage)
+	}
+}
+
+func TestOpenAICompatClientStreamsToolCallFragments(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, l := range []string{
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search_files","arguments":"{\"que"}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ry\":\"x\"}"}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"list_folder","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+			`data: [DONE]`,
+		} {
+			_, _ = w.Write([]byte(l + "\n\n"))
+		}
+	}))
+	defer srv.Close()
+
+	client, _ := NewVercelGatewayClient("k", srv.URL+"/v1")
+	resp, err := client.Chat(context.Background(), ChatRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+		OnDelta:  func(string) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := resp.Message.ToolCalls
+	if len(tc) != 2 || tc[0].ID != "call_1" || tc[0].Name != "search_files" || tc[0].Arguments != `{"query":"x"}` || tc[1].Name != "list_folder" {
+		t.Fatalf("tool calls=%+v", tc)
+	}
+}
+
+func TestOpenAICompatClientStreamHTTPErrorUsesJSONErrorPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad key"}}`))
+	}))
+	defer srv.Close()
+	client, _ := NewVercelGatewayClient("k", srv.URL+"/v1")
+	_, err := client.Chat(context.Background(), ChatRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+		OnDelta:  func(string) {},
+	})
+	if err == nil || !strings.Contains(err.Error(), "bad key") {
+		t.Fatalf("err=%v", err)
+	}
+}
