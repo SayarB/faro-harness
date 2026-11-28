@@ -114,19 +114,15 @@ func (a *App) CreateBot(name, instructions string) (desktop.BotInfo, error) {
 	return a.ctl.CreateBot(a.ctx, name, instructions)
 }
 
-// NewChat starts a fresh conversation with the given bot (the UI passes the default "faro" bot unless the user picked another).
-func (a *App) NewChat(botSlug string) (desktop.ChatInfo, error) {
-	return a.ctl.NewChat(a.ctx, botSlug)
+// BotChat returns the bot's one chat, creating it the first time. A bot has a single
+// conversation; the UI opens it by calling OpenChat with the returned id.
+func (a *App) BotChat(botSlug string) (desktop.ChatInfo, error) {
+	return a.ctl.BotChat(a.ctx, botSlug)
 }
 
 // OpenChat loads an existing conversation on demand and returns its replayable event snapshot.
 func (a *App) OpenChat(convID string) (desktop.Snapshot, error) {
 	return a.ctl.OpenChat(a.ctx, convID)
-}
-
-// ListChats returns recent single-bot conversations ordered newest first.
-func (a *App) ListChats() ([]desktop.ChatSummary, error) {
-	return a.ctl.ListChats(a.ctx)
 }
 
 // Send starts a chat turn in convID and returns its turn id; progress arrives on the event channel.

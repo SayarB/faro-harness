@@ -30,7 +30,7 @@ func startChat(t *testing.T, h *harness, botSlug string) (string, string) {
 	t.Helper()
 	_ = h.c.SaveAPIKey("k")
 	ws := h.addFolder(t)
-	chat, err := h.c.NewChat(context.Background(), botSlug)
+	chat, err := h.c.BotChat(context.Background(), botSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestUnsandboxedCommandIsNeverSessionApproved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	chat, err := h.c.NewChat(context.Background(), b.Slug)
+	chat, err := h.c.BotChat(context.Background(), b.Slug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestApprovalRequestEscapesControlCharacters(t *testing.T) {
 	}})
 	_ = h.c.SaveAPIKey("k")
 	b, _ := h.c.CreateBot(context.Background(), "Esc", "")
-	chat, _ := h.c.NewChat(context.Background(), b.Slug)
+	chat, _ := h.c.BotChat(context.Background(), b.Slug)
 	_, _ = h.c.Send(context.Background(), chat.ConversationID, "go")
 	req := h.nextApproval(t)
 	if strings.ContainsAny(req.Command, "\x1b\r\n\u202e") || !strings.Contains(req.Command, `\u001b[2J\r\n`) || !strings.Contains(req.Command, `\u202e`) {

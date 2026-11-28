@@ -103,6 +103,17 @@ func New(opts Options) (*Controller, error) {
 func (c *Controller) Shutdown() {
 	c.cancel()
 	c.wg.Wait()
+	c.mu.Lock()
+	sessions := make([]*agent.Session, 0, len(c.chats))
+	for _, ch := range c.chats {
+		if ch.sess != nil {
+			sessions = append(sessions, ch.sess)
+		}
+	}
+	c.mu.Unlock()
+	for _, s := range sessions {
+		s.Close()
+	}
 	c.hub.closeAll()
 }
 
@@ -297,17 +308,40 @@ func slugify(name string) string {
 	return s
 }
 
-// NewChat starts a fresh conversation with the bot botSlug. Every chat has a bot; the UI
-// selects the default one ("faro") unless the user picks another.
-func (c *Controller) NewChat(ctx context.Context, botSlug string) (ChatInfo, error) {
+// BotChat returns the bot's one chat, creating it on first use. A bot has exactly one
+// conversation for its whole life; there is no way to start a second one. Opening an existing
+// chat is allowed while a turn runs; creating the first chat of a bot is not.
+func (c *Controller) BotChat(ctx context.Context, botSlug string) (ChatInfo, error) {
+	botSlug = strings.TrimSpace(botSlug)
+	if botSlug == "" {
+		return ChatInfo{}, errors.New("choose an assistant first")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	b, err := c.bots.Get(ctx, botSlug)
+	if err != nil {
+		return ChatInfo{}, err
+	}
+	if b == nil {
+		return ChatInfo{}, fmt.Errorf("bot %q not found", botSlug)
+	}
+	conv, err := c.st.BotConversation(ctx, b.ID)
+	if err != nil {
+		return ChatInfo{}, err
+	}
+	if conv != nil {
+		entry, err := c.loadChatLocked(ctx, conv.ID)
+		if err != nil {
+			return ChatInfo{}, err
+		}
+		return ChatInfo{ConversationID: entry.convID, BotSlug: entry.botSlug}, nil
+	}
 	if c.busy {
 		return ChatInfo{}, errors.New("a reply is still in progress")
 	}
 	entry := &chatEntry{}
 	entry.gate = c.newGate(func() string { return entry.convID })
-	sess, b, err := c.buildSession(ctx, botSlug, "", entry.gate, func(ev agent.Event) {
+	sess, b, err := c.buildSession(ctx, b.Slug, "", entry.gate, func(ev agent.Event) {
 		c.onAgentEvent(entry.convID, ev)
 	})
 	if err != nil {
@@ -395,7 +429,7 @@ func (c *Controller) loadChatLocked(ctx context.Context, convID string) (*chatEn
 	return entry, nil
 }
 
-// ListChats returns up to 50 recent single-bot conversations ordered newest first.
+// ListChats returns each bot's one chat, most recently active first.
 func (c *Controller) ListChats(ctx context.Context) ([]ChatSummary, error) {
 	rows, err := c.st.ListConversationsWithBot(ctx, maxListedChats)
 	if err != nil {
@@ -520,6 +554,7 @@ func (c *Controller) Send(ctx context.Context, convID, text string) (string, err
 		return "", err
 	}
 	if entry.stale {
+		oldSess := entry.sess
 		rebuilt, _, err := c.buildSession(ctx, entry.botSlug, entry.convID, entry.gate, func(ev agent.Event) {
 			c.onAgentEvent(entry.convID, ev)
 		})
@@ -527,6 +562,13 @@ func (c *Controller) Send(ctx context.Context, convID, text string) (string, err
 			return "", err
 		}
 		entry.sess, entry.stale = rebuilt, false
+		if oldSess != nil {
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				oldSess.Close()
+			}()
+		}
 	}
 	startMsgSeq, err := c.st.MaxMessageSeq(ctx, entry.convID)
 	if err != nil {

@@ -199,8 +199,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 		_ = writeJSONLine(conn, rpcResponse{OK: true, Chats: chats})
 
-	case "new_chat":
-		info, err := s.ctl.NewChat(ctx, req.BotSlug)
+	case "bot_chat":
+		info, err := s.ctl.BotChat(ctx, req.BotSlug)
 		if err != nil {
 			_ = writeJSONLine(conn, rpcResponse{OK: false, Error: err.Error()})
 			return

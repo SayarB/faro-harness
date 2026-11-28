@@ -219,18 +219,18 @@ func TestUserBotCannotTakeTheDefaultSlug(t *testing.T) {
 
 func TestEveryChatHasABot(t *testing.T) {
 	h := newHarness(t, &fakeClient{})
-	if _, err := h.c.NewChat(context.Background(), DefaultBotSlug); err == nil || !strings.Contains(err.Error(), "API key") {
+	if _, err := h.c.BotChat(context.Background(), DefaultBotSlug); err == nil || !strings.Contains(err.Error(), "API key") {
 		t.Fatalf("err=%v", err)
 	}
 	_ = h.c.SaveAPIKey("k")
-	if _, err := h.c.NewChat(context.Background(), ""); err == nil {
-		t.Fatal("a chat without a bot must be rejected")
+	if _, err := h.c.BotChat(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "choose an assistant") {
+		t.Fatalf("a chat without a bot must be rejected cleanly, got err=%v", err)
 	}
-	if _, err := h.c.NewChat(context.Background(), "nope"); err == nil {
+	if _, err := h.c.BotChat(context.Background(), "nope"); err == nil {
 		t.Fatal("an unknown bot must be rejected")
 	}
 	// The default bot alone is enough to chat: no folder needed, and it has its own workspace tools.
-	chat, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	chat, err := h.c.BotChat(context.Background(), DefaultBotSlug)
 	if err != nil || chat.BotSlug != DefaultBotSlug {
 		t.Fatalf("chat=%+v err=%v", chat, err)
 	}
@@ -248,7 +248,7 @@ func TestSendStreamsTokensAndToolEventsThenDone(t *testing.T) {
 	h := newHarness(t, fc)
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
-	chat, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	chat, err := h.c.BotChat(context.Background(), DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,11 +305,15 @@ func TestSendRejectsConcurrentTurnAndCancelStopsIt(t *testing.T) {
 	h := newHarness(t, fc)
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
-	chat1, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	chat1, err := h.c.BotChat(context.Background(), DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
-	chat2, err := h.c.NewChat(context.Background(), DefaultBotSlug)
+	other, err := h.c.CreateBot(context.Background(), "Other", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat2, err := h.c.BotChat(context.Background(), other.Slug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,8 +327,15 @@ func TestSendRejectsConcurrentTurnAndCancelStopsIt(t *testing.T) {
 	if _, err := h.c.Send(context.Background(), chat2.ConversationID, "other"); err == nil {
 		t.Fatal("second concurrent turn on another conversation must be rejected")
 	}
-	if _, err := h.c.NewChat(context.Background(), DefaultBotSlug); err == nil {
-		t.Fatal("NewChat during a turn must be rejected")
+	third, err := h.c.CreateBot(context.Background(), "Third", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.c.BotChat(context.Background(), third.Slug); err == nil {
+		t.Fatal("creating a bot's first chat during a turn must be rejected")
+	}
+	if again, err := h.c.BotChat(context.Background(), DefaultBotSlug); err != nil || again.ConversationID != chat1.ConversationID {
+		t.Fatalf("opening an existing chat during a turn must still work: %+v %v", again, err)
 	}
 	h.c.Cancel(chat2.ConversationID) // another conversation's cancel must not stop this turn
 	select {
@@ -349,7 +360,7 @@ func TestFolderAddedMidChatIsMountedOnNextTurn(t *testing.T) {
 	h := newHarness(t, fc)
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
-	chat, _ := h.c.NewChat(context.Background(), DefaultBotSlug)
+	chat, _ := h.c.BotChat(context.Background(), DefaultBotSlug)
 	_, _ = h.c.Send(context.Background(), chat.ConversationID, "q1")
 	h.waitFor(t, isTurnEnd)
 	h.addFolder(t)
@@ -371,5 +382,49 @@ func TestTruncateIsRuneSafe(t *testing.T) {
 	out := truncate(s, 5)
 	if !strings.HasSuffix(out, "…") || strings.ContainsRune(out, '�') {
 		t.Fatalf("out=%q", out)
+	}
+}
+
+func TestBotChatIsOneChatPerBot(t *testing.T) {
+	h := newHarness(t, &fakeClient{})
+	ctx := context.Background()
+	_ = h.c.SaveAPIKey("k")
+
+	first, err := h.c.BotChat(ctx, DefaultBotSlug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.c.BotChat(ctx, DefaultBotSlug)
+	if err != nil || second.ConversationID != first.ConversationID {
+		t.Fatalf("second call must return the same chat: %+v vs %+v (err=%v)", second, first, err)
+	}
+	other, err := h.c.CreateBot(ctx, "Quiz maker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherChat, err := h.c.BotChat(ctx, other.Slug)
+	if err != nil || otherChat.ConversationID == first.ConversationID {
+		t.Fatalf("another bot must get its own chat: %+v (err=%v)", otherChat, err)
+	}
+	list, err := h.c.ListChats(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("want one chat per bot, got %+v (err=%v)", list, err)
+	}
+
+	// Regression for I1: a stray newer single-bot conversation created outside the controller
+	// (e.g. standalone CLI) must never displace the bot's original canonical chat.
+	faroBot, err := h.c.bots.Get(ctx, DefaultBotSlug)
+	if err != nil || faroBot == nil {
+		t.Fatalf("get default bot: %v", err)
+	}
+	if _, err := h.c.st.CreateConversation(ctx, "conv_zzzz_stray", "", faroBot.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.c.st.AppendMessages(ctx, "conv_zzzz_stray", []store.MessageRecord{{Role: "user", Content: "stray"}}); err != nil {
+		t.Fatal(err)
+	}
+	again, err := h.c.BotChat(ctx, DefaultBotSlug)
+	if err != nil || again.ConversationID != first.ConversationID {
+		t.Fatalf("stray newer conversation hijacked BotChat: got %+v want %s (err=%v)", again, first.ConversationID, err)
 	}
 }

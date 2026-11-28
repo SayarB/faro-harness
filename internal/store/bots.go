@@ -55,6 +55,19 @@ type MessageRecord struct {
 	CreatedAt      int64
 }
 
+// ChunkSummary stores a cached compacted summary for one chunk (or the merged epoch at ChunkIndex=-1)
+// of a conversation. The raw transcript in messages is never mutated or deleted.
+type ChunkSummary struct {
+	ConversationID string
+	ChunkIndex     int
+	Level          string
+	StartSeq       int
+	EndSeq         int
+	SourceHash     string
+	Summary        string
+	UpdatedAt      int64
+}
+
 // CreateBot inserts a new bot record in SQLite.
 func (s *Store) CreateBot(ctx context.Context, b Bot) (Bot, error) {
 	now := time.Now().Unix()
@@ -320,7 +333,88 @@ func (s *Store) MaxMessageSeq(ctx context.Context, conversationID string) (int, 
 	return maxSeq, err
 }
 
-// ListConversationsWithBot returns recent single-bot conversations newest first, along with each
+// ListChunkSummaries returns all persisted compaction summaries for conversationID.
+func (s *Store) ListChunkSummaries(ctx context.Context, conversationID string) ([]ChunkSummary, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT conversation_id, chunk_index, level, start_seq, end_seq, source_hash, summary, updated_at
+		FROM conversation_summaries
+		WHERE conversation_id = ?
+		ORDER BY chunk_index ASC, level ASC
+	`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ChunkSummary
+	for rows.Next() {
+		var rec ChunkSummary
+		if err := rows.Scan(
+			&rec.ConversationID, &rec.ChunkIndex, &rec.Level,
+			&rec.StartSeq, &rec.EndSeq, &rec.SourceHash, &rec.Summary, &rec.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// UpsertChunkSummary stores or updates a compacted chunk or epoch summary for a conversation.
+func (s *Store) UpsertChunkSummary(ctx context.Context, rec ChunkSummary) error {
+	now := rec.UpdatedAt
+	if now == 0 {
+		now = time.Now().Unix()
+	}
+	_, err := s.writer.ExecContext(ctx, `
+		INSERT INTO conversation_summaries (
+			conversation_id, chunk_index, level, start_seq, end_seq, source_hash, summary, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(conversation_id, chunk_index, level) DO UPDATE SET
+			start_seq = excluded.start_seq,
+			end_seq = excluded.end_seq,
+			source_hash = excluded.source_hash,
+			summary = excluded.summary,
+			updated_at = excluded.updated_at
+	`, rec.ConversationID, rec.ChunkIndex, rec.Level, rec.StartSeq, rec.EndSeq, rec.SourceHash, rec.Summary, now)
+	return err
+}
+
+// botChatIDQuery selects the id of a bot's canonical single-bot conversation (its oldest one,
+// matching migrateV5ToV6 so stray conversations created outside the desktop controller cannot
+// displace the bot's primary history). Correlated against p.bot_id in the enclosing query.
+const botChatIDQuery = `
+	SELECT c2.id
+	FROM conversations c2
+	JOIN conversation_participants p2 ON p2.conversation_id = c2.id
+	WHERE p2.bot_id = p.bot_id
+	  AND (SELECT COUNT(*) FROM conversation_participants p3 WHERE p3.conversation_id = c2.id) = 1
+	ORDER BY c2.created_at ASC, c2.id ASC
+	LIMIT 1`
+
+// BotConversation returns the bot's canonical chat: its oldest single-bot conversation (matching
+// migrateV5ToV6), or nil if it has none yet.
+func (s *Store) BotConversation(ctx context.Context, botID string) (*Conversation, error) {
+	var c Conversation
+	err := s.reader.QueryRowContext(ctx, `
+		SELECT c.id, c.title, c.created_at, c.updated_at
+		FROM conversations c
+		JOIN conversation_participants p ON p.conversation_id = c.id
+		WHERE p.bot_id = ?
+		  AND (SELECT COUNT(*) FROM conversation_participants p2 WHERE p2.conversation_id = c.id) = 1
+		ORDER BY c.created_at ASC, c.id ASC
+		LIMIT 1
+	`, botID).Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// ListConversationsWithBot returns each bot's one chat newest first, along with the
 // conversation's bot slug/name and first user message in a single query.
 func (s *Store) ListConversationsWithBot(ctx context.Context, limit int) ([]ConversationSummary, error) {
 	if limit <= 0 {
@@ -342,7 +436,7 @@ func (s *Store) ListConversationsWithBot(ctx context.Context, limit int) ([]Conv
 		FROM conversations c
 		JOIN conversation_participants p ON p.conversation_id = c.id
 		JOIN bots b ON b.id = p.bot_id
-		WHERE (SELECT COUNT(*) FROM conversation_participants p2 WHERE p2.conversation_id = c.id) = 1
+		WHERE c.id = (`+botChatIDQuery+`)
 		ORDER BY c.updated_at DESC, c.id DESC
 		LIMIT ?
 	`, limit)

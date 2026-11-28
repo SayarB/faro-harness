@@ -64,7 +64,7 @@ func TestTwoSubscribersSeeIdenticalOrderedEventsAndTurnStartedBeforeSendReturns(
 	h := newHarness(t, sc)
 	ctx := context.Background()
 	_ = h.c.SaveAPIKey("k")
-	chat, err := h.c.NewChat(ctx, DefaultBotSlug)
+	chat, err := h.c.BotChat(ctx, DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestAttachMidTurnAfterPersistedToolBatchHasNoDuplicates(t *testing.T) {
 	ctx := context.Background()
 	_ = h.c.SaveAPIKey("k")
 	h.addFolder(t)
-	chat, err := h.c.NewChat(ctx, DefaultBotSlug)
+	chat, err := h.c.BotChat(ctx, DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestSnapshotBetweenFinalPersistAndTurnDoneHasNoDuplicates(t *testing.T) {
 	h := newHarness(t, &fakeClient{})
 	ctx := context.Background()
 	_ = h.c.SaveAPIKey("k")
-	chat, err := h.c.NewChat(ctx, DefaultBotSlug)
+	chat, err := h.c.BotChat(ctx, DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestListChatsReturnsNewestFirstWithPreview(t *testing.T) {
 	ctx := context.Background()
 	_ = h.c.SaveAPIKey("k")
 
-	chat, err := h.c.NewChat(ctx, DefaultBotSlug)
+	chat, err := h.c.BotChat(ctx, DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -26,7 +26,7 @@ const (
 	StatusTooLarge    = "too_large"
 	StatusError       = "error"
 
-	currentSchemaVersion = 5
+	currentSchemaVersion = 7
 )
 
 // Workspace represents a registered root folder in the catalog.
@@ -175,6 +175,18 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+	conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	chunk_index     INTEGER NOT NULL,
+	level           TEXT NOT NULL,
+	start_seq       INTEGER NOT NULL,
+	end_seq         INTEGER NOT NULL,
+	source_hash     TEXT NOT NULL,
+	summary         TEXT NOT NULL,
+	updated_at      INTEGER NOT NULL,
+	PRIMARY KEY (conversation_id, chunk_index, level)
+);
 
 CREATE TABLE IF NOT EXISTS content_blobs (
 	blake3         TEXT NOT NULL,
@@ -342,6 +354,20 @@ func migrateSchema(db *sql.DB) error {
 
 	if userVersion < 5 {
 		if err := migrateV4ToV5(db); err != nil {
+			return err
+		}
+		userVersion = 5
+	}
+
+	if userVersion < 6 {
+		if err := migrateV5ToV6(db); err != nil {
+			return err
+		}
+		userVersion = 6
+	}
+
+	if userVersion < 7 {
+		if err := migrateV6ToV7(db); err != nil {
 			return err
 		}
 	}
@@ -761,6 +787,141 @@ func migrateV4ToV5(db *sql.DB) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// migrateV5ToV6 enforces "one conversation per bot" on existing data: every bot that has several
+// single-bot conversations gets them merged into its oldest one, with messages kept in the order
+// of the conversations they came from (each conversation's messages stay contiguous, so tool
+// calls and their results are never split). The emptied conversations are deleted. Bot-less and
+// multi-bot conversations are left alone. It is one transaction: it either merges everything or
+// nothing.
+func migrateV5ToV6(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Single-bot conversations per bot, oldest first.
+	rows, err := tx.Query(`
+		SELECT p.bot_id, c.id
+		FROM conversations c
+		JOIN conversation_participants p ON p.conversation_id = c.id
+		WHERE (SELECT COUNT(*) FROM conversation_participants p2 WHERE p2.conversation_id = c.id) = 1
+		ORDER BY p.bot_id, c.created_at, c.id
+	`)
+	if err != nil {
+		return err
+	}
+	convsByBot := map[string][]string{}
+	for rows.Next() {
+		var botID, convID string
+		if err := rows.Scan(&botID, &convID); err != nil {
+			rows.Close()
+			return err
+		}
+		convsByBot[botID] = append(convsByBot[botID], convID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, convs := range convsByBot {
+		if len(convs) < 2 {
+			continue
+		}
+		target := convs[0]
+		seq := 0
+		for _, conv := range convs {
+			ids, err := messageIDsInOrder(tx, conv)
+			if err != nil {
+				return err
+			}
+			for _, id := range ids {
+				seq++
+				if _, err := tx.Exec(`UPDATE messages SET conversation_id = ?, seq = ? WHERE id = ?`, target, seq, id); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.Exec(`
+			UPDATE conversations
+			SET updated_at = (SELECT MAX(updated_at) FROM conversations WHERE id IN (`+placeholders(len(convs))+`))
+			WHERE id = ?`, append(stringsToAny(convs), target)...); err != nil {
+			return err
+		}
+		for _, conv := range convs[1:] {
+			if _, err := tx.Exec(`DELETE FROM conversations WHERE id = ?`, conv); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := tx.Exec(`PRAGMA user_version = 6`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV6ToV7 adds the conversation_summaries table used by geometric multi-tier history
+// compaction (chunk summaries and the single epoch summary per conversation).
+func migrateV6ToV7(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS conversation_summaries (
+			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			chunk_index     INTEGER NOT NULL,
+			level           TEXT NOT NULL,
+			start_seq       INTEGER NOT NULL,
+			end_seq         INTEGER NOT NULL,
+			source_hash     TEXT NOT NULL,
+			summary         TEXT NOT NULL,
+			updated_at      INTEGER NOT NULL,
+			PRIMARY KEY (conversation_id, chunk_index, level)
+		);
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`PRAGMA user_version = 7`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func messageIDsInOrder(tx *sql.Tx, convID string) ([]int64, error) {
+	rows, err := tx.Query(`SELECT id FROM messages WHERE conversation_id = ? ORDER BY seq, id`, convID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func stringsToAny(in []string) []any {
+	out := make([]any, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
 }
 
 func addColumnIfMissing(tx *sql.Tx, table, column, def string) error {

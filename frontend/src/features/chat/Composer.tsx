@@ -7,10 +7,11 @@ export function Composer() {
   const send = useStore((s) => s.send);
   const cancel = useStore((s) => s.cancel);
   const busy = useBusy();
+  const ready = useStore((s) => s.chatReady);
   const [text, setText] = useState("");
 
   function submit() {
-    if (busy || !text.trim()) return;
+    if (busy || !ready || !text.trim()) return;
     void send(text);
     setText("");
   }
@@ -37,7 +38,7 @@ export function Composer() {
             Stop
           </Button>
         ) : (
-          <Button variant="primary" onClick={submit} disabled={!text.trim()}>
+          <Button variant="primary" onClick={submit} disabled={!ready || !text.trim()}>
             Send
           </Button>
         )}

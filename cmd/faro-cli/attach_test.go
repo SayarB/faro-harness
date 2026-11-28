@@ -90,7 +90,7 @@ func TestAttachInteractiveApprovalAndAppResolution(t *testing.T) {
 	if _, err := ctl.AddWorkspace(ctx, root); err != nil {
 		t.Fatal(err)
 	}
-	chat, err := cli.NewChat(ctx, desktop.DefaultBotSlug)
+	chat, err := cli.BotChat(ctx, desktop.DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestSendOneShotPrintsWaitingForAppApprovalAndExitsOnTurnDone(t *testing.T) 
 	if _, err := ctl.AddWorkspace(ctx, root); err != nil {
 		t.Fatal(err)
 	}
-	chat, err := cli.NewChat(ctx, desktop.DefaultBotSlug)
+	chat, err := cli.BotChat(ctx, desktop.DefaultBotSlug)
 	if err != nil {
 		t.Fatal(err)
 	}

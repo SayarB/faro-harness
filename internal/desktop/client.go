@@ -76,9 +76,9 @@ func (c *Client) ListChats(ctx context.Context) ([]ChatSummary, error) {
 	return resp.Chats, nil
 }
 
-// NewChat starts a new conversation on the desktop host for botSlug.
-func (c *Client) NewChat(ctx context.Context, botSlug string) (ChatInfo, error) {
-	resp, err := c.call(ctx, rpcRequest{Method: "new_chat", BotSlug: botSlug})
+// BotChat returns botSlug's one chat on the desktop host, creating it on first use.
+func (c *Client) BotChat(ctx context.Context, botSlug string) (ChatInfo, error) {
+	resp, err := c.call(ctx, rpcRequest{Method: "bot_chat", BotSlug: botSlug})
 	if err != nil {
 		return ChatInfo{}, err
 	}

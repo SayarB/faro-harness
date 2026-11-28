@@ -3,12 +3,12 @@
 import { Events } from "@wailsio/runtime";
 import * as App from "../../bindings/github.com/SayarB/faro-harness/app";
 import type * as desktop from "../../bindings/github.com/SayarB/faro-harness/internal/desktop/models";
-import type { ApprovalDecision, ChatInfo, ChatSummary, FaroEvent, Snapshot } from "./events";
+import type { ApprovalDecision, ChatInfo, FaroEvent, Snapshot } from "./events";
 
 export type AppState = desktop.State;
 export type Workspace = desktop.WorkspaceInfo;
 export type Bot = desktop.BotInfo;
-export type { ChatInfo, ChatSummary, Snapshot };
+export type { ChatInfo, Snapshot };
 
 // Must match eventChannel in app.go.
 const EVENT_CHANNEL = "faro:event";
@@ -20,13 +20,11 @@ export const bridge = {
   pickFolder: async (): Promise<Workspace | null> => (await App.PickFolder()) ?? null,
   rescan: (workspaceId: number): Promise<void> => App.Rescan(workspaceId),
   createBot: (name: string, instructions: string): Promise<Bot> => App.CreateBot(name, instructions),
-  /** Starts a fresh conversation with the given bot. Every chat has a bot. */
-  newChat: (botSlug: string): Promise<ChatInfo> => App.NewChat(botSlug) as Promise<ChatInfo>,
+  /** Returns the bot's one chat, creating it the first time. A bot never has more than one. */
+  botChat: (botSlug: string): Promise<ChatInfo> => App.BotChat(botSlug) as Promise<ChatInfo>,
   /** Loads an existing conversation and returns its replayable event snapshot. */
   openChat: (conversationId: string): Promise<Snapshot> =>
     App.OpenChat(conversationId) as Promise<Snapshot>,
-  /** Lists recent single-bot conversations ordered newest first. */
-  listChats: async (): Promise<ChatSummary[]> => ((await App.ListChats()) ?? []) as ChatSummary[],
   /** Starts a turn in conversationId and resolves with its id; progress arrives via onEvent. */
   send: (conversationId: string, text: string): Promise<string> => App.Send(conversationId, text),
   /** Stops the running turn if it belongs to this conversation. */
