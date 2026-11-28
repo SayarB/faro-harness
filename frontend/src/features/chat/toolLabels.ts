@@ -17,6 +17,7 @@ const LABELS: Record<string, ToolLabel> = {
   bot_write: { running: "Writing a note", done: "Wrote a note" },
   bot_delete: { running: "Removing a note", done: "Removed a note" },
   bot_run_command: { running: "Running a command", done: "Ran a command", declined: "Run a command" },
+  conversation_history: { running: "Checking earlier messages", done: "Checked earlier messages" },
 };
 
 export function toolLabel(name: string, status: "running" | "done" | "error" | "declined"): string {

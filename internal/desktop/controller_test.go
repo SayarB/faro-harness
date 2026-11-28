@@ -223,8 +223,8 @@ func TestEveryChatHasABot(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 	_ = h.c.SaveAPIKey("k")
-	if _, err := h.c.BotChat(context.Background(), ""); err == nil {
-		t.Fatal("a chat without a bot must be rejected")
+	if _, err := h.c.BotChat(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "choose an assistant") {
+		t.Fatalf("a chat without a bot must be rejected cleanly, got err=%v", err)
 	}
 	if _, err := h.c.BotChat(context.Background(), "nope"); err == nil {
 		t.Fatal("an unknown bot must be rejected")
@@ -409,5 +409,22 @@ func TestBotChatIsOneChatPerBot(t *testing.T) {
 	list, err := h.c.ListChats(ctx)
 	if err != nil || len(list) != 2 {
 		t.Fatalf("want one chat per bot, got %+v (err=%v)", list, err)
+	}
+
+	// Regression for I1: a stray newer single-bot conversation created outside the controller
+	// (e.g. standalone CLI) must never displace the bot's original canonical chat.
+	faroBot, err := h.c.bots.Get(ctx, DefaultBotSlug)
+	if err != nil || faroBot == nil {
+		t.Fatalf("get default bot: %v", err)
+	}
+	if _, err := h.c.st.CreateConversation(ctx, "conv_zzzz_stray", "", faroBot.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.c.st.AppendMessages(ctx, "conv_zzzz_stray", []store.MessageRecord{{Role: "user", Content: "stray"}}); err != nil {
+		t.Fatal(err)
+	}
+	again, err := h.c.BotChat(ctx, DefaultBotSlug)
+	if err != nil || again.ConversationID != first.ConversationID {
+		t.Fatalf("stray newer conversation hijacked BotChat: got %+v want %s (err=%v)", again, first.ConversationID, err)
 	}
 }

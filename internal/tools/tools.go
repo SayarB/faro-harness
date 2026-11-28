@@ -218,6 +218,9 @@ func (r *Registry) Definitions() []llm.ToolDef {
 	if r.bot != nil {
 		defs = append(defs, botToolDefinitions()...)
 	}
+	if r.currentConversationID() != "" {
+		defs = append(defs, conversationHistoryToolDefinition())
+	}
 	return defs
 }
 
@@ -249,6 +252,8 @@ func (r *Registry) Execute(ctx context.Context, name string, rawArgs string) (st
 		res, err = r.execBotDelete(ctx, rawArgs)
 	case "bot_run_command":
 		res, err = r.execBotRunCommand(ctx, rawArgs)
+	case "conversation_history":
+		res, err = r.execConversationHistory(ctx, rawArgs)
 	default:
 		return marshalToolError(fmt.Sprintf("unknown tool %q", name)), nil
 	}

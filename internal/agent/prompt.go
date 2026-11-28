@@ -24,6 +24,7 @@ Guidelines:
   - ` + "`metadata_only`" + `: the index only saw the filename, folder, size, and date.
   If a file might answer the user's question and isn't ` + "`full`" + `, inspect or read it before concluding.
 - Cite the exact file path (and section/sheet/page when relevant) for every fact you report.
+- Earlier parts of long conversations may be summarized with message ranges (for example [messages 1-8]). For exact wording from earlier messages, call ` + "`conversation_history`" + ` rather than guessing.
 - Never claim to have created, edited, moved, or deleted files in the user's folders unless a workspace write tool succeeded in this conversation.`
 
 // BotWorkshopPrompt is appended to Layer 1a only when running as a dedicated bot with

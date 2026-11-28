@@ -55,7 +55,7 @@ export function ApprovalDialog() {
           {req.kind === "command" ? (
             <>
               {req.sandboxed ? (
-                <Button onClick={() => void respond("allow_session")}>Allow commands for this chat</Button>
+                <Button onClick={() => void respond("allow_session")}>Allow commands until Faro restarts</Button>
               ) : null}
               <Button variant="danger" onClick={() => void respond("allow")}>
                 Allow once
@@ -67,7 +67,9 @@ export function ApprovalDialog() {
             </Button>
           ) : (
             <>
-              <Button onClick={() => void respond("allow_session")}>Allow new files in this folder for this chat</Button>
+              <Button onClick={() => void respond("allow_session")}>
+                Allow new files in this folder until Faro restarts
+              </Button>
               <Button variant="primary" onClick={() => void respond("allow")}>
                 Allow once
               </Button>

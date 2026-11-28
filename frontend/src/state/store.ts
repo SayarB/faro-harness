@@ -111,7 +111,9 @@ export const useStore = create<Store>((set, get) => {
       unsubscribe = bridge.onEvent(onEvent);
       try {
         await refresh();
-        await get().selectBot(get().botSlug);
+        if (get().view === "chat") {
+          await get().selectBot(get().botSlug);
+        }
       } catch (err) {
         fail(err);
       }
@@ -121,7 +123,9 @@ export const useStore = create<Store>((set, get) => {
       try {
         await bridge.saveApiKey(key);
         await refresh();
-        await get().selectBot(get().botSlug);
+        if (get().view === "chat") {
+          await get().selectBot(get().botSlug);
+        }
         return true;
       } catch (err) {
         fail(err);
@@ -201,8 +205,8 @@ export const useStore = create<Store>((set, get) => {
           openingConvId = null;
           openBuffer = [];
           set((st) => ({ approval: missed.reduce<PendingApproval | null>((cur, ev) => applyApprovalEvent(cur, ev), st.approval) }));
+          fail(err);
         }
-        fail(err);
       }
     },
 

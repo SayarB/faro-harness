@@ -202,8 +202,9 @@ func TestMaxMessageSeqAndListConversationsWithBot(t *testing.T) {
 	}
 }
 
-func TestBotConversationReturnsNewestSingleBotChatOnly(t *testing.T) {
-	st, err := store.Open(":memory:")
+func TestBotConversationReturnsOldestSingleBotChatOnly(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "oldest.db")
+	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +217,7 @@ func TestBotConversationReturnsNewestSingleBotChatOnly(t *testing.T) {
 	if c, err := st.BotConversation(ctx, b1.ID); err != nil || c != nil {
 		t.Fatalf("no chat yet: got %+v err=%v", c, err)
 	}
-	// Legacy duplicates: two chats for b1; the more recently updated one wins.
+	// Duplicate chats for b1 plus a multi-bot chat.
 	for _, id := range []string{"old", "new"} {
 		if _, err := st.CreateConversation(ctx, id, "", b1.ID); err != nil {
 			t.Fatal(err)
@@ -225,17 +226,25 @@ func TestBotConversationReturnsNewestSingleBotChatOnly(t *testing.T) {
 	if _, err := st.CreateConversation(ctx, "multi", "", b1.ID, b2.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AppendMessages(ctx, "multi", []store.MessageRecord{{Role: "user", Content: "x"}}); err != nil {
+	// Set explicit timestamps: "old" was created earlier, even though "new" was updated more recently.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Force "old" to be the most recently updated single-bot chat.
-	if err := st.AppendMessages(ctx, "old", []store.MessageRecord{{Role: "user", Content: "hi"}}); err != nil {
-		t.Fatal(err)
+	for _, q := range []string{
+		`UPDATE conversations SET created_at = 100, updated_at = 150 WHERE id = 'old'`,
+		`UPDATE conversations SET created_at = 200, updated_at = 999 WHERE id = 'new'`,
+		`UPDATE conversations SET created_at = 50, updated_at = 1000 WHERE id = 'multi'`,
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
 	}
+	_ = raw.Close()
 
 	c, err := st.BotConversation(ctx, b1.ID)
-	if err != nil || c == nil || c.ID == "multi" {
-		t.Fatalf("got %+v err=%v; must never return a multi-bot conversation", c, err)
+	if err != nil || c == nil || c.ID != "old" {
+		t.Fatalf("got %+v err=%v; want exact oldest single-bot conversation 'old'", c, err)
 	}
 	list, err := st.ListConversationsWithBot(ctx, 50)
 	if err != nil {
@@ -245,8 +254,8 @@ func TestBotConversationReturnsNewestSingleBotChatOnly(t *testing.T) {
 	for _, it := range list {
 		if it.BotSlug == "faro" {
 			n++
-			if it.ID != c.ID {
-				t.Fatalf("list returned %s, BotConversation returned %s", it.ID, c.ID)
+			if it.ID != "old" {
+				t.Fatalf("list returned %s, want 'old'", it.ID)
 			}
 		}
 	}
@@ -337,5 +346,126 @@ func TestMigrateV5ToV6MergesEachBotsChatsIntoOne(t *testing.T) {
 	}
 	if m, _ := st.ListMessages(ctx, "multi"); len(m) != 1 {
 		t.Fatalf("multi=%+v", m)
+	}
+}
+
+func TestMigrateV5ToV7EdgeCasesAndChunkSummaries(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "edge.db")
+	ctx := context.Background()
+
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, _ := st.CreateBot(ctx, store.Bot{ID: "bot_1", Slug: "empty-bot", Name: "Empty", HomePath: "/tmp/e"})
+	b2, _ := st.CreateBot(ctx, store.Bot{ID: "bot_2", Slug: "tie-bot", Name: "Tie", HomePath: "/tmp/t"})
+	// All-empty bot with two empty chats.
+	_, _ = st.CreateConversation(ctx, "e_a", "", b1.ID)
+	_, _ = st.CreateConversation(ctx, "e_b", "", b1.ID)
+	// Same created_at tie-break + empty chat merged + seq != id order with tool calls.
+	_, _ = st.CreateConversation(ctx, "tie_b", "", b2.ID)
+	_, _ = st.CreateConversation(ctx, "tie_a", "", b2.ID)
+	_, _ = st.CreateConversation(ctx, "tie_empty", "", b2.ID)
+	// Bot-less chat must stay untouched.
+	_, _ = st.CreateConversation(ctx, "nobot", "")
+	_ = st.AppendMessages(ctx, "nobot", []store.MessageRecord{{Role: "user", Content: "solo"}})
+	_ = st.AppendMessages(ctx, "tie_a", []store.MessageRecord{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", BotID: b2.ID, ToolCallsJSON: `[{"id":"tc1","name":"list_folder","arguments":"{}"}]`},
+		{Role: "tool", BotID: b2.ID, ToolCallID: "tc1", ToolName: "list_folder", Content: `{}`},
+		{Role: "assistant", BotID: b2.ID, Content: "a1"},
+	})
+	_ = st.AppendMessages(ctx, "tie_b", []store.MessageRecord{
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", BotID: b2.ID, Content: "a2"},
+	})
+	_ = st.Close()
+
+	// Downgrade to v5, force identical created_at on tie_a & tie_b, and invert seq vs id on tie_b.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS conversation_summaries`,
+		`UPDATE conversations SET created_at = 100, updated_at = 100 WHERE id IN ('e_a', 'e_b', 'tie_a', 'tie_b')`,
+		`UPDATE conversations SET created_at = 200, updated_at = 300 WHERE id = 'tie_empty'`,
+		`UPDATE messages SET seq = 20 WHERE conversation_id = 'tie_b' AND content = 'q2'`,
+		`UPDATE messages SET seq = 10 WHERE conversation_id = 'tie_b' AND content = 'a2'`,
+		`PRAGMA user_version = 5`,
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	_ = raw.Close()
+
+	// Open runs v5 -> v6 -> v7.
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// All-empty bot keeps e_a (id ASC) and deletes e_b.
+	if c, _ := st.BotConversation(ctx, b1.ID); c == nil || c.ID != "e_a" {
+		t.Fatalf("all-empty bot chat=%+v want e_a", c)
+	}
+	if c, _ := st.GetConversation(ctx, "e_b"); c != nil {
+		t.Fatal("e_b must be deleted")
+	}
+
+	// tie_a wins tie-break over tie_b (id ASC), tie_empty deleted, updated_at = 300, seq order preserved.
+	if c, _ := st.BotConversation(ctx, b2.ID); c == nil || c.ID != "tie_a" || c.UpdatedAt != 300 {
+		t.Fatalf("tie-bot chat=%+v want tie_a updated_at=300", c)
+	}
+	for _, gone := range []string{"tie_b", "tie_empty"} {
+		if c, _ := st.GetConversation(ctx, gone); c != nil {
+			t.Fatalf("%s must be deleted", gone)
+		}
+		if ps, _ := st.ConversationParticipants(ctx, gone); len(ps) != 0 {
+			t.Fatalf("participants for deleted %s must cascade: %+v", gone, ps)
+		}
+	}
+	if ps, _ := st.ConversationParticipants(ctx, "tie_a"); len(ps) != 1 || ps[0] != b2.ID {
+		t.Fatalf("kept chat participants=%+v", ps)
+	}
+	msgs, err := st.ListMessages(ctx, "tie_a")
+	if err != nil || len(msgs) != 6 {
+		t.Fatalf("tie_a msgs=%+v err=%v", msgs, err)
+	}
+	// In tie_b we swapped seq so 'a2' (seq 10) came before 'q2' (seq 20); migration must preserve seq order.
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "tc1" || msgs[4].Content != "a2" || msgs[5].Content != "q2" {
+		t.Fatalf("unexpected merged order: %+v", msgs)
+	}
+	// Bot-less chat untouched.
+	if m, _ := st.ListMessages(ctx, "nobot"); len(m) != 1 || m[0].Content != "solo" {
+		t.Fatalf("nobot=%+v", m)
+	}
+
+	// Chunk summaries CRUD works after v7 migration.
+	if err := st.UpsertChunkSummary(ctx, store.ChunkSummary{
+		ConversationID: "tie_a", ChunkIndex: 0, Level: "detail", StartSeq: 1, EndSeq: 4, SourceHash: "abc", Summary: "first summary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertChunkSummary(ctx, store.ChunkSummary{
+		ConversationID: "tie_a", ChunkIndex: 0, Level: "detail", StartSeq: 1, EndSeq: 4, SourceHash: "def", Summary: "updated summary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sums, err := st.ListChunkSummaries(ctx, "tie_a")
+	if err != nil || len(sums) != 1 || sums[0].Summary != "updated summary" || sums[0].SourceHash != "def" {
+		t.Fatalf("sums=%+v err=%v", sums, err)
+	}
+	_ = st.Close()
+
+	// Reopening a v7 DB is a clean no-op.
+	st2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if sums2, err := st2.ListChunkSummaries(ctx, "tie_a"); err != nil || len(sums2) != 1 {
+		t.Fatalf("reopen v7 sums=%+v err=%v", sums2, err)
 	}
 }

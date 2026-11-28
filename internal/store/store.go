@@ -26,7 +26,7 @@ const (
 	StatusTooLarge    = "too_large"
 	StatusError       = "error"
 
-	currentSchemaVersion = 6
+	currentSchemaVersion = 7
 )
 
 // Workspace represents a registered root folder in the catalog.
@@ -175,6 +175,18 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+	conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	chunk_index     INTEGER NOT NULL,
+	level           TEXT NOT NULL,
+	start_seq       INTEGER NOT NULL,
+	end_seq         INTEGER NOT NULL,
+	source_hash     TEXT NOT NULL,
+	summary         TEXT NOT NULL,
+	updated_at      INTEGER NOT NULL,
+	PRIMARY KEY (conversation_id, chunk_index, level)
+);
 
 CREATE TABLE IF NOT EXISTS content_blobs (
 	blake3         TEXT NOT NULL,
@@ -349,6 +361,13 @@ func migrateSchema(db *sql.DB) error {
 
 	if userVersion < 6 {
 		if err := migrateV5ToV6(db); err != nil {
+			return err
+		}
+		userVersion = 6
+	}
+
+	if userVersion < 7 {
+		if err := migrateV6ToV7(db); err != nil {
 			return err
 		}
 	}
@@ -841,6 +860,36 @@ func migrateV5ToV6(db *sql.DB) error {
 	}
 
 	if _, err := tx.Exec(`PRAGMA user_version = 6`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// migrateV6ToV7 adds the conversation_summaries table used by geometric multi-tier history
+// compaction (chunk summaries and the single epoch summary per conversation).
+func migrateV6ToV7(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS conversation_summaries (
+			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+			chunk_index     INTEGER NOT NULL,
+			level           TEXT NOT NULL,
+			start_seq       INTEGER NOT NULL,
+			end_seq         INTEGER NOT NULL,
+			source_hash     TEXT NOT NULL,
+			summary         TEXT NOT NULL,
+			updated_at      INTEGER NOT NULL,
+			PRIMARY KEY (conversation_id, chunk_index, level)
+		);
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`PRAGMA user_version = 7`); err != nil {
 		return err
 	}
 	return tx.Commit()
