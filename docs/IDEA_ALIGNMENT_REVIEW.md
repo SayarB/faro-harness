@@ -66,9 +66,11 @@ Ordered by importance. Each fix follows `AGENTS.md`: hard boundaries go in code,
 Asking for approval on every command keeps this honest today. But it means the whole safety net depends on the user reading every shell command, which a non-technical user cannot do.
 
 **Fix:**
-1. **Ship a real OS sandbox before anything else in this list.** Landlock on Linux, Seatbelt on macOS, AppContainer or a restricted token on Windows. The policy should be: read-only access to workspaces, read-write only to `scratch/`, `.tmp/` and the uv cache, **no access to the app-data dir or to the bot's own `.faro/`**, and no network.
-2. **Move the network exception into its own step.** Today the network is open so that `uv` can download packages. Instead, run dependency installs as a separate, explicitly approved step (or ship the bundled runtime from Phase 3), so the script itself runs offline. That also satisfies the rule that anything leaving the machine always asks.
-3. **Until the sandbox ships,** keep per-command approval and say plainly in the approval dialog that the command *can* change files outside Faro's safety net. The dialog already avoids claiming a sandbox; it should also name this specific risk.
+*(Updated design in [`OS_SANDBOX_DESIGN.md`](OS_SANDBOX_DESIGN.md): instead of an interactive `bot_install_packages` prompt or session-approved commands, Faro provisions a curated, hash-pinned Python 3.12 runtime during first-run setup, runs OS-sandboxed network-blocked scripts automatically without prompting, and hard-disables `bot_run_command` in Desktop whenever no OS sandbox is verified active.)*
+
+1. **Ship a real OS sandbox before anything else in this list.** Landlock on Linux, Seatbelt on macOS, AppContainer or a restricted token on Windows. The policy should be: read-only access to workspaces, read-write only to `scratch/` and `.tmp/`, **no access to the app-data dir or to the bot's own `.faro/`**, and no network.
+2. **Pre-install a curated runtime instead of opening network in scripts.** Provision a hash-pinned Python 3.12 runtime mounted read-only into `bot_run_command` during first-run setup (via `uv` for now, bundled later), so scripts themselves never have network access and non-technical users are never asked to approve PyPI package names.
+3. **Until the sandbox ships on a platform,** hard-disable `bot_run_command` in the desktop app (surfacing the setup/sandbox error with Retry) and keep per-command approval in the CLI stating plainly that unsandboxed commands *can* change files outside Faro's safety net.
 
 ### Gap 2: There is no undo, so the safety net is only half built (critical)
 
